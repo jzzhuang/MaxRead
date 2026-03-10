@@ -1,0 +1,6 @@
+# Feishu / Lark Open Platform SDK
+lark-oapi>=1.2.0
+# Load credentials from .env
+python-dotenv>=1.0.0
+# Optional: anthropic (used by claude_client if you add reply logic)
+anthropic>=0.39.0
