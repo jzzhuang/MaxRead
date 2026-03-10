@@ -1,7 +1,11 @@
 """
 Parse Markdown into a list of (block_type, content) for Feishu docx.
-Supports: headings, $$...$$ equations, **bold** and *italic* (via inline parser),
-bullet/ordered lists, and tables (separator row skipped).
+Supports: headings, display equations (`$$...$$`, `\[...\]`), **bold** and
+*italic* (via inline parser), bullet/ordered lists, and tables
+(separator row skipped).
+
+Markdown headings of any depth are accepted; levels 4+ are downgraded to Feishu's
+deepest supported native heading level.
 """
 import re
 from typing import Any, Union
@@ -14,7 +18,9 @@ from .constants import (
     DOCX_BLOCK_TYPE_EQUATION,
     DOCX_BLOCK_TYPE_BULLET,
     DOCX_BLOCK_TYPE_ORDERED,
+    DOCX_BLOCK_TYPE_DIVIDER,
     DOCX_BLOCK_TYPE_TABLE,
+    DOCX_BLOCK_TYPE_IMAGE,
 )
 
 # Content is either plain string or table payload {"rows": [[cell, ...], ...]}
@@ -79,12 +85,43 @@ def _ordered_content(line: str) -> str:
 
 
 def _is_display_equation(line: str) -> tuple[bool, str]:
-    """If line is only $$...$$ (display equation), return (True, content). Else (False, '')."""
+    """If line is only a supported display equation, return (True, content)."""
     stripped = line.strip()
-    m = re.fullmatch(r"\$\$([^$]*)\$\$", stripped)
-    if m:
-        return (True, m.group(1).strip())
+    for pattern in (r"\$\$(.*?)\$\$", r"\\\[(.*?)\\\]"):
+        m = re.fullmatch(pattern, stripped)
+        if m:
+            return (True, m.group(1).strip())
     return (False, "")
+
+
+def _is_divider_line(line: str) -> bool:
+    """True if line is a Markdown horizontal rule using hyphens."""
+    return bool(re.fullmatch(r"\s*-{3,}\s*", line))
+
+
+def _parse_heading_line(line: str) -> tuple[int, str] | None:
+    """Parse Markdown headings and map level 4+ to heading3."""
+    m = re.match(r"^(#{1,6})\s+(.*)$", line.strip())
+    if not m:
+        return None
+    level = len(m.group(1))
+    content = m.group(2).strip()
+    if not content:
+        return None
+    if level == 1:
+        return (DOCX_BLOCK_TYPE_HEADING1, content)
+    if level == 2:
+        return (DOCX_BLOCK_TYPE_HEADING2, content)
+    return (DOCX_BLOCK_TYPE_HEADING3, content)
+
+
+def _parse_image_line(line: str) -> dict[str, str] | None:
+    """Parse a standalone Markdown image line like ![alt](path)."""
+    stripped = line.strip()
+    m = re.fullmatch(r"!\[([^\]]*)\]\(([^)]+)\)", stripped)
+    if not m:
+        return None
+    return {"alt": m.group(1).strip(), "path": m.group(2).strip()}
 
 
 def parse_md_to_blocks(md: str) -> list[tuple[int, BlockContent]]:
@@ -92,8 +129,8 @@ def parse_md_to_blocks(md: str) -> list[tuple[int, BlockContent]]:
     Parse Markdown into a list of (block_type, content) for Feishu docx.
     content is str for text/headings/lists, or {"rows": [[cell,...],...]} for table.
     Tables: separator row (|---|---|) is skipped and not emitted.
-    Only a whole line that is exactly $$...$$ becomes an equation block; $$...$$ inside
-    a paragraph stays inline and is rendered as equation elements in the same text block.
+    Only a whole line that is exactly `$$...$$` or `\[...\]` becomes an equation
+    block; inline math stays inside the text block and is rendered later.
     """
     blocks: list[tuple[int, BlockContent]] = []
     lines = md.split("\n")
@@ -121,31 +158,33 @@ def parse_md_to_blocks(md: str) -> list[tuple[int, BlockContent]]:
                 para_lines = []
             j += 1
             continue
-        if stripped.startswith("### "):
+        if _is_divider_line(line):
             if para_lines:
                 t = "\n".join(para_lines).strip()
                 if t:
                     blocks.append((DOCX_BLOCK_TYPE_TEXT, t))
                 para_lines = []
-            blocks.append((DOCX_BLOCK_TYPE_HEADING3, stripped[4:].strip()))
+            blocks.append((DOCX_BLOCK_TYPE_DIVIDER, ""))
             j += 1
             continue
-        if stripped.startswith("## "):
+        heading = _parse_heading_line(line)
+        if heading is not None:
             if para_lines:
                 t = "\n".join(para_lines).strip()
                 if t:
                     blocks.append((DOCX_BLOCK_TYPE_TEXT, t))
                 para_lines = []
-            blocks.append((DOCX_BLOCK_TYPE_HEADING2, stripped[3:].strip()))
+            blocks.append(heading)
             j += 1
             continue
-        if stripped.startswith("# "):
+        image = _parse_image_line(line)
+        if image is not None:
             if para_lines:
                 t = "\n".join(para_lines).strip()
                 if t:
                     blocks.append((DOCX_BLOCK_TYPE_TEXT, t))
                 para_lines = []
-            blocks.append((DOCX_BLOCK_TYPE_HEADING1, stripped[2:].strip()))
+            blocks.append((DOCX_BLOCK_TYPE_IMAGE, image))
             j += 1
             continue
         # Table: collect consecutive table lines, skip separator

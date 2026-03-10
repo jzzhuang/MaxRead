@@ -104,7 +104,12 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         try:
             summary = run_summarize(arxiv_id, data_dir=ROOT / "reader" / "data")
             title = f"arXiv {arxiv_id} 摘要"
-            doc_id = create_summary_doc(_feishu_client, title, summary) if _feishu_client else None
+            paper_dir = ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
+            doc_id = (
+                create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
+                if _feishu_client
+                else None
+            )
             if doc_id:
                 tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
                 reply_text = f"已创建云文档「{title}」，内容：\n\n{summary}\n\n👉 打开文档：{doc_url(doc_id, tenant_key)}"

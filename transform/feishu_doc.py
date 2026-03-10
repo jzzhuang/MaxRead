@@ -4,13 +4,20 @@ Supports inline bold/italic, bullet/ordered lists, and native tables.
 """
 import logging
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from uuid import uuid4
 from typing import Any, Union
 
 from lark_oapi.api.docx.v1.model.block import Block
+from lark_oapi.api.docx.v1.model.image import Image
 from lark_oapi.api.docx.v1.model.text import Text
 from lark_oapi.api.docx.v1.model.text_element import TextElement
 from lark_oapi.api.docx.v1.model.text_run import TextRun
 from lark_oapi.api.docx.v1.model.text_element_style import TextElementStyle
+from lark_oapi.api.docx.v1.model.divider import Divider
 from lark_oapi.api.docx.v1.model.equation import Equation
 from lark_oapi.api.docx.v1.model.table import Table
 from lark_oapi.api.docx.v1.model.table_property import TableProperty
@@ -22,8 +29,22 @@ from lark_oapi.api.docx.v1.model.create_document_block_children_request import (
 from lark_oapi.api.docx.v1.model.create_document_block_children_request_body import (
     CreateDocumentBlockChildrenRequestBody,
 )
-from lark_oapi.api.docx.v1.model.get_document_block_children_request import GetDocumentBlockChildrenRequest
-from lark_oapi.api.docx.v1.model.text_style import TextStyle
+from lark_oapi.api.docx.v1.model.create_document_block_descendant_request import (
+    CreateDocumentBlockDescendantRequest,
+)
+from lark_oapi.api.docx.v1.model.create_document_block_descendant_request_body import (
+    CreateDocumentBlockDescendantRequestBody,
+)
+from lark_oapi.api.docx.v1.model.patch_document_block_request import (
+    PatchDocumentBlockRequest,
+)
+from lark_oapi.api.docx.v1.model.replace_image_request import ReplaceImageRequest
+from lark_oapi.api.docx.v1.model.update_block_request import UpdateBlockRequest
+from lark_oapi.api.docx.v1.model.table_cell import TableCell
+from lark_oapi.api.drive.v1.model.upload_all_media_request import UploadAllMediaRequest
+from lark_oapi.api.drive.v1.model.upload_all_media_request_body import (
+    UploadAllMediaRequestBody,
+)
 
 from .constants import (
     DOCX_BLOCK_TYPE_TEXT,
@@ -33,7 +54,9 @@ from .constants import (
     DOCX_BLOCK_TYPE_EQUATION,
     DOCX_BLOCK_TYPE_BULLET,
     DOCX_BLOCK_TYPE_ORDERED,
+    DOCX_BLOCK_TYPE_DIVIDER,
     DOCX_BLOCK_TYPE_TABLE,
+    DOCX_BLOCK_TYPE_IMAGE,
     TABLE_FULL_WIDTH,
 )
 from .parser import parse_md_to_blocks
@@ -42,6 +65,15 @@ from .inline import parse_inline
 logger = logging.getLogger(__name__)
 
 BlockContent = Union[str, dict[str, Any]]
+INLINE_EQUATION_RE = re.compile(
+    r"""
+    \$\$(?P<display_dollar>.+?)\$\$
+    |\\\[(?P<display_bracket>.+?)\\\]
+    |\\\((?P<inline_paren>.+?)\\\)
+    |(?<!\$)\$(?!\$)(?P<inline_dollar>.+?)(?<!\$)\$(?!\$)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
 
 
 def _build_text_elements(content: str) -> list:
@@ -71,28 +103,33 @@ def _build_text_elements(content: str) -> list:
 
 
 def _build_text_elements_with_inline_equations(content: str) -> list:
-    """Build list of TextElement from content that may contain $$...$$ inline equations.
-    Splits on $$...$$; text segments get bold/italic via _build_text_elements, equation
-    segments become equation elements. Result is a single block's elements (no separate equation blocks)."""
+    """Build TextElements from content with common inline/display LaTeX syntax."""
     if not content:
         return [
             TextElement.builder()
             .text_run(TextRun.builder().content(" ").build())
             .build()
         ]
-    parts = re.split(r"\$\$([^$]*)\$\$", content)
     elements: list = []
-    for i, part in enumerate(parts):
-        if i % 2 == 1:
-            # Equation segment
-            eq_content = part.strip()
-            if eq_content:
-                eq = Equation.builder().content(eq_content).build()
-                elements.append(TextElement.builder().equation(eq).build())
-        else:
-            # Text segment (may contain ** and *)
-            if part:
-                elements.extend(_build_text_elements(part))
+    cursor = 0
+    for match in INLINE_EQUATION_RE.finditer(content):
+        text_part = content[cursor : match.start()]
+        if text_part:
+            elements.extend(_build_text_elements(text_part))
+
+        eq_content = next(
+            (group.strip() for group in match.groupdict().values() if group and group.strip()),
+            "",
+        )
+        if eq_content:
+            eq = Equation.builder().content(eq_content).build()
+            elements.append(TextElement.builder().equation(eq).build())
+        cursor = match.end()
+
+    trailing_text = content[cursor:]
+    if trailing_text:
+        elements.extend(_build_text_elements(trailing_text))
+
     if not elements:
         elements = [
             TextElement.builder()
@@ -147,7 +184,13 @@ def build_block(block_type: int, content: BlockContent) -> Block:
         table = Table.builder().property(table_prop).cells([]).build()
         return Block.builder().block_type(DOCX_BLOCK_TYPE_TABLE).table(table).build()
 
-    # Text, heading, bullet, ordered: content is string, may contain **, *, and inline $$...$$
+    if block_type == DOCX_BLOCK_TYPE_IMAGE:
+        return Block.builder().block_type(DOCX_BLOCK_TYPE_IMAGE).image(Image.builder().build()).build()
+
+    if block_type == DOCX_BLOCK_TYPE_DIVIDER:
+        return Block.builder().block_type(DOCX_BLOCK_TYPE_DIVIDER).divider(Divider.builder().build()).build()
+
+    # Text, heading, bullet, ordered: content may contain **, *, and inline LaTeX.
     text_str = content if isinstance(content, str) else ""
     text_obj = Text.builder().elements(_build_text_elements_with_inline_equations(text_str or " ")).build()
     builder = Block.builder().block_type(block_type)
@@ -165,85 +208,255 @@ def build_block(block_type: int, content: BlockContent) -> Block:
     return builder.text(text_obj).build()
 
 
-def _fill_table_cells(client, document_id: str, table_block_id: str, rows: list[list[str]]) -> None:
-    """After creating a table block, get its cell blocks and add a text child block to each cell.
-    Table cells (block_type 32) do not support update_text; content must be in child blocks."""
+def _build_table_descendant_body(
+    rows: list[list[str]], index: int
+) -> CreateDocumentBlockDescendantRequestBody | None:
+    """Build a nested table payload so cell content is created with the table itself."""
     if not rows:
-        return
-    col_count = max(len(r) for r in rows)
-    # Flatten row-major: row0_cell0, row0_cell1, ..., row1_cell0, ... (strip to avoid trailing newlines)
-    cell_texts = []
+        return None
+    row_count = len(rows)
+    col_count = max(len(r) for r in rows) if rows else 0
+    if row_count == 0 or col_count == 0:
+        return None
+
+    width_per_col = TABLE_FULL_WIDTH // col_count
+    column_widths = [width_per_col] * col_count
+    column_widths[0] += TABLE_FULL_WIDTH - sum(column_widths)
+
+    table_id = f"tbl_{uuid4().hex}"
+    descendants: list[Block] = []
+    cell_ids: list[str] = []
+
     for row in rows:
-        padded = [str(c).strip() for c in row] + [""] * (col_count - len(row))
-        cell_texts.extend(padded[:col_count])
-    # Get table's children (table_cell blocks)
-    get_req = (
-        GetDocumentBlockChildrenRequest.builder()
-        .document_id(document_id)
-        .block_id(table_block_id)
-        .page_size(500)
+        padded_row = [str(c).strip() for c in row] + [""] * (col_count - len(row))
+        for raw_cell in padded_row[:col_count]:
+            cell_id = f"cell_{uuid4().hex}"
+            normalized = raw_cell.replace("\n", " ").replace("\r", " ").strip()
+            child_ids: list[str] = []
+            cell_descendants: list[Block] = []
+
+            if normalized:
+                text_block_id = f"cell_text_{uuid4().hex}"
+                text_block = (
+                    Block.builder()
+                    .block_id(text_block_id)
+                    .block_type(DOCX_BLOCK_TYPE_TEXT)
+                    .text(Text.builder().elements(_build_text_elements_with_inline_equations(normalized)).build())
+                    .children([])
+                    .build()
+                )
+                cell_descendants.append(text_block)
+                child_ids.append(text_block_id)
+
+            cell_block = (
+                Block.builder()
+                .block_id(cell_id)
+                .block_type(32)
+                .table_cell(TableCell.builder().build())
+                .children(child_ids)
+                .build()
+            )
+            descendants.append(cell_block)
+            descendants.extend(cell_descendants)
+            cell_ids.append(cell_id)
+
+    table_prop = (
+        TableProperty.builder()
+        .row_size(row_count)
+        .column_size(col_count)
+        .column_width(column_widths)
+        .header_row(True)
         .build()
     )
-    get_resp = client.docx.v1.document_block_children.get(get_req)
-    if getattr(get_resp, "code", 0) != 0:
-        logger.warning("Get table children failed: %s %s", getattr(get_resp, "code"), getattr(get_resp, "msg"))
-        return
-    items = getattr(get_resp, "data") and getattr(get_resp.data, "items") or []
-    # Paginate if has_more
-    while getattr(get_resp.data, "has_more") and getattr(get_resp.data, "page_token"):
-        get_req = (
-            GetDocumentBlockChildrenRequest.builder()
-            .document_id(document_id)
-            .block_id(table_block_id)
-            .page_size(500)
-            .page_token(get_resp.data.page_token)
-            .build()
+    table_block = (
+        Block.builder()
+        .block_id(table_id)
+        .block_type(DOCX_BLOCK_TYPE_TABLE)
+        .table(Table.builder().property(table_prop).cells(cell_ids).build())
+        .children(cell_ids)
+        .build()
+    )
+    descendants.insert(0, table_block)
+    return (
+        CreateDocumentBlockDescendantRequestBody.builder()
+        .children_id([table_id])
+        .descendants(descendants)
+        .index(index)
+        .build()
+    )
+
+
+def _markdown_image_fallback(content: BlockContent) -> str:
+    if not isinstance(content, dict):
+        return ""
+    alt = str(content.get("alt") or "").strip()
+    path = str(content.get("path") or "").strip()
+    return f"![{alt}]({path})" if path else alt
+
+
+def _resolve_image_path(image_path: str, base_dir: Path | None) -> Path | None:
+    candidate = Path(image_path).expanduser()
+    if not candidate.is_absolute():
+        if base_dir is None:
+            return None
+        candidate = base_dir / candidate
+    candidate = candidate.resolve()
+    return candidate if candidate.is_file() else None
+
+
+def _prepare_upload_image(image_path: Path) -> tuple[Path, str | None]:
+    if image_path.suffix.lower() != ".pdf":
+        return image_path, None
+
+    if shutil.which("pdftoppm") is None:
+        raise RuntimeError("pdftoppm not found; cannot convert PDF figures to PNG")
+
+    temp_dir = tempfile.mkdtemp(prefix="maxread-feishu-img-")
+    out_prefix = Path(temp_dir) / image_path.stem
+    proc = subprocess.run(
+        [
+            "pdftoppm",
+            "-f",
+            "1",
+            "-l",
+            "1",
+            "-singlefile",
+            "-png",
+            str(image_path),
+            str(out_prefix),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"PDF to PNG conversion failed: {err}")
+
+    png_path = out_prefix.with_suffix(".png")
+    if not png_path.is_file():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError("PDF to PNG conversion did not produce an output file")
+    return png_path, temp_dir
+
+
+def _create_block_child(client, document_id: str, index: int, block: Block):
+    children_body = (
+        CreateDocumentBlockChildrenRequestBody.builder()
+        .children([block])
+        .index(index)
+        .build()
+    )
+    add_req = (
+        CreateDocumentBlockChildrenRequest.builder()
+        .document_id(document_id)
+        .block_id(document_id)
+        .request_body(children_body)
+        .build()
+    )
+    return client.docx.v1.document_block_children.create(add_req)
+
+
+def _insert_image_block(
+    client,
+    document_id: str,
+    index: int,
+    content: BlockContent,
+    base_dir: Path | None,
+) -> bool:
+    if not isinstance(content, dict):
+        return False
+
+    raw_path = str(content.get("path") or "").strip()
+    if not raw_path:
+        return False
+
+    image_path = _resolve_image_path(raw_path, base_dir)
+    if image_path is None:
+        logger.warning("Image file not found for Feishu upload: %s", raw_path)
+        return False
+
+    create_resp = _create_block_child(client, document_id, index, build_block(DOCX_BLOCK_TYPE_IMAGE, content))
+    if getattr(create_resp, "code", 0) != 0:
+        logger.warning(
+            "Create image block failed at index %s: %s %s",
+            index,
+            getattr(create_resp, "code"),
+            getattr(create_resp, "msg"),
         )
-        get_resp = client.docx.v1.document_block_children.get(get_req)
-        if getattr(get_resp, "code", 0) != 0:
-            break
-        more = getattr(get_resp, "data") and getattr(get_resp.data, "items") or []
-        items.extend(more)
-    if len(items) < len(cell_texts):
-        logger.warning("Table has %s cells but got %s child blocks", len(cell_texts), len(items))
-    # Add a text block as child of each table cell (cells don't support update_text).
-    # Normalize content: no newlines (replace with space) to avoid extra line breaks; skip empty cells.
-    for i, block in enumerate(items):
-        if i >= len(cell_texts):
-            break
-        raw = cell_texts[i]
-        cell_content = (raw if isinstance(raw, str) else str(raw)).strip().replace("\n", " ").replace("\r", " ")
-        if not cell_content:
-            continue  # Skip adding block for empty cells to avoid trailing blank line
-        text_elements = _build_text_elements(cell_content)
-        # Use folded=True to avoid extra line break after paragraph in table cells
-        cell_text_style = TextStyle.builder().folded(True).build()
-        text_obj = Text.builder().elements(text_elements).style(cell_text_style).build()
-        text_block = Block.builder().block_type(DOCX_BLOCK_TYPE_TEXT).text(text_obj).build()
-        child_body = (
-            CreateDocumentBlockChildrenRequestBody.builder()
-            .children([text_block])
-            .index(0)
-            .build()
-        )
-        add_req = (
-            CreateDocumentBlockChildrenRequest.builder()
-            .document_id(document_id)
-            .block_id(block.block_id)
-            .request_body(child_body)
-            .build()
-        )
-        add_resp = client.docx.v1.document_block_children.create(add_req)
-        if getattr(add_resp, "code", 0) != 0:
-            logger.warning(
-                "Add text to table cell %s failed: %s %s",
-                block.block_id,
-                getattr(add_resp, "code"),
-                getattr(add_resp, "msg"),
+        return False
+
+    children = getattr(getattr(create_resp, "data", None), "children", None) or []
+    block_id = getattr(children[0], "block_id", None) if children else None
+    if not block_id:
+        logger.warning("Create image block returned no block_id at index %s", index)
+        return False
+
+    upload_path = image_path
+    temp_dir: str | None = None
+    try:
+        upload_path, temp_dir = _prepare_upload_image(image_path)
+        upload_body = UploadAllMediaRequestBody()
+        upload_body.file_name = upload_path.name
+        upload_body.parent_type = "docx_image"
+        upload_body.parent_node = block_id
+        upload_body.size = upload_path.stat().st_size
+        with upload_path.open("rb") as f:
+            upload_body.file = f
+            upload_req = (
+                UploadAllMediaRequest.builder()
+                .request_body(upload_body)
+                .build()
             )
+            upload_resp = client.drive.v1.media.upload_all(upload_req)
+
+        if getattr(upload_resp, "code", 0) != 0:
+            logger.warning(
+                "Upload image failed for %s: %s %s",
+                upload_path,
+                getattr(upload_resp, "code"),
+                getattr(upload_resp, "msg"),
+            )
+            return False
+
+        file_token = getattr(getattr(upload_resp, "data", None), "file_token", None)
+        if not file_token:
+            logger.warning("Upload image returned no file token for %s", upload_path)
+            return False
+
+        patch_body = UpdateBlockRequest()
+        patch_body.replace_image = ReplaceImageRequest({"token": file_token})
+        patch_req = (
+            PatchDocumentBlockRequest.builder()
+            .document_id(document_id)
+            .block_id(block_id)
+            .document_revision_id(-1)
+            .request_body(patch_body)
+            .build()
+        )
+        patch_resp = client.docx.v1.document_block.patch(patch_req)
+        if getattr(patch_resp, "code", 0) != 0:
+            logger.warning(
+                "Replace image failed for %s: %s %s",
+                upload_path,
+                getattr(patch_resp, "code"),
+                getattr(patch_resp, "msg"),
+            )
+            return False
+        return True
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def create_summary_doc(client, title: str, md_content: str) -> str | None:
+def create_summary_doc(
+    client,
+    title: str,
+    md_content: str,
+    *,
+    base_dir: str | Path | None = None,
+) -> str | None:
     """
     Create a cloud doc (云文档) from Markdown summary with sections, text, equations,
     lists (bullet/ordered), and native tables (separator row skipped).
@@ -270,22 +483,29 @@ def create_summary_doc(client, title: str, md_content: str) -> str | None:
         parsed = parse_md_to_blocks(md_content)
         if not parsed:
             parsed = [(DOCX_BLOCK_TYPE_TEXT, md_content.strip() or "（无内容）")]
+        resolved_base_dir = Path(base_dir).resolve() if base_dir is not None else None
         for index, (btype, content) in enumerate(parsed):
-            block = build_block(btype, content)
-            children_body = (
-                CreateDocumentBlockChildrenRequestBody.builder()
-                .children([block])
-                .index(index)
-                .build()
-            )
-            add_req = (
-                CreateDocumentBlockChildrenRequest.builder()
-                .document_id(document_id)
-                .block_id(document_id)
-                .request_body(children_body)
-                .build()
-            )
-            add_resp = client.docx.v1.document_block_children.create(add_req)
+            if btype == DOCX_BLOCK_TYPE_TABLE and isinstance(content, dict) and content.get("rows"):
+                descendant_body = _build_table_descendant_body(content["rows"], index)
+                if descendant_body is None:
+                    continue
+                add_req = (
+                    CreateDocumentBlockDescendantRequest.builder()
+                    .document_id(document_id)
+                    .block_id(document_id)
+                    .document_revision_id(-1)
+                    .request_body(descendant_body)
+                    .build()
+                )
+                add_resp = client.docx.v1.document_block_descendant.create(add_req)
+            else:
+                if btype == DOCX_BLOCK_TYPE_IMAGE:
+                    if _insert_image_block(client, document_id, index, content, resolved_base_dir):
+                        continue
+                    content = _markdown_image_fallback(content) or "（图片上传失败）"
+                    btype = DOCX_BLOCK_TYPE_TEXT
+                block = build_block(btype, content)
+                add_resp = _create_block_child(client, document_id, index, block)
             if getattr(add_resp, "code", 0) != 0:
                 logger.warning(
                     "Add block failed at index %s: %s %s",
@@ -293,12 +513,6 @@ def create_summary_doc(client, title: str, md_content: str) -> str | None:
                     getattr(add_resp, "code"),
                     getattr(add_resp, "msg"),
                 )
-            elif btype == DOCX_BLOCK_TYPE_TABLE and isinstance(content, dict) and content.get("rows"):
-                # Fill table cells: get created table block id and update each cell
-                data = getattr(add_resp, "data")
-                children = getattr(data, "children") if data else None
-                if children and len(children) >= 1 and getattr(children[0], "block_id", None):
-                    _fill_table_cells(client, document_id, children[0].block_id, content["rows"])
         return document_id
     except Exception as e:
         logger.exception("Create summary doc failed: %s", e)

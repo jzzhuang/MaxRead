@@ -28,8 +28,10 @@ from transform.constants import (
     DOCX_BLOCK_TYPE_EQUATION,
     DOCX_BLOCK_TYPE_BULLET,
     DOCX_BLOCK_TYPE_ORDERED,
+    DOCX_BLOCK_TYPE_DIVIDER,
     DOCX_BLOCK_TYPE_TABLE,
     DOCX_BLOCK_TYPE_CODE,
+    DOCX_BLOCK_TYPE_IMAGE,
 )
 
 BLOCK_NAMES = {
@@ -40,8 +42,10 @@ BLOCK_NAMES = {
     DOCX_BLOCK_TYPE_EQUATION: "equation",
     DOCX_BLOCK_TYPE_BULLET: "bullet",
     DOCX_BLOCK_TYPE_ORDERED: "ordered",
+    DOCX_BLOCK_TYPE_DIVIDER: "divider",
     DOCX_BLOCK_TYPE_TABLE: "table",
     DOCX_BLOCK_TYPE_CODE: "code",
+    DOCX_BLOCK_TYPE_IMAGE: "image",
 }
 
 
@@ -106,7 +110,7 @@ def main() -> None:
             print("ERROR: Missing FEISHU_APP_ID or FEISHU_APP_SECRET in feishu/.env", file=sys.stderr)
             sys.exit(1)
         client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
-        doc_id = create_summary_doc(client, title, content)
+        doc_id = create_summary_doc(client, title, content, base_dir=md_path.parent)
         if not doc_id:
             print("ERROR: Failed to create Feishu document", file=sys.stderr)
             sys.exit(1)

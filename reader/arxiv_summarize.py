@@ -2,7 +2,7 @@
 """
 For an arXiv link: download TeX source, unzip into data/, launch the Claude CLI
 in that folder so it can read the files and write a concise summary to
-summarize.md (Markdown with sections, paragraphs, and LaTeX equations in $$...$$),
+summarize.md (Markdown with sections, paragraphs, and LaTeX equations),
 then print the result.
 Requires the `claude` command (Claude Code) to be installed and authenticated.
 """
@@ -18,14 +18,19 @@ from pathlib import Path
 # ArXiv requires a descriptive User-Agent
 USER_AGENT = "MaxRead-arxiv-summarize/1.0 (mailto:research@example.com)"
 DATA_DIR = Path(__file__).resolve().parent / "data"
-SUMMARY_PROMPT = """Summarize the paper in this folder concisely and write the result to summarize.md.
+SUMMARY_PROMPT = """请阅读此文件夹中的论文内容，并将结果写入 summarize.md。
 
-Requirements:
-- Output file: summarize.md (Markdown).
-- Use clear sections with ## or ### headings (e.g. ## Summary, ## Method, ## Key results).
-- Use short paragraphs of plain text.
-- For important math, use LaTeX in display form: $$...$$ for block equations, or \\( ... \\) for inline.
-- Keep the summary concise but informative (a few short sections, not a full rewrite)."""
+要求：
+- 所有输出内容必须全部使用中文。
+- 输出文件必须是 summarize.md（Markdown 格式）。
+- 内容要写得详尽、完整，不要只写简短摘要。需要系统介绍论文的研究问题、背景动机、核心方法、实验设置、主要结果、局限性与结论。
+- 使用清晰的 ## 或 ### 标题组织内容。
+- 以较完整的中文段落进行说明，避免只有零散的要点式罗列。
+- 对重要公式使用标准 LaTeX 表达，支持常见形式如 $...$、$$...$$、\\( ... \\)、\\[ ... \\] 等。
+- 尤其要重视论文中的图片、表格、可视化内容。对论文中的每一张图片、表格都要单独保留，并配上中文说明，解释该图展示了什么、对应论文哪一部分、可以得出哪些关键信息。
+- 论文中的全部图片都必须保留并写入 summarize.md，尽量按照论文中的出现顺序插入，使用 Markdown 图片语法引用本地图片文件。
+- 如果论文中存在表格，也请逐一说明其内容和结论；如果表格能转成 Markdown 表格，也尽量保留在 summarize.md 中。
+- 最终的 summarize.md 应该是一份中文的、内容详尽的论文解读文档，并且包含论文中的全部图片及其说明和表格及其说明。"""
 
 
 # Bare arXiv id: YYMM.NNNNN or YYMM.NNNNNvN
