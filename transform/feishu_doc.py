@@ -29,6 +29,8 @@ from lark_oapi.api.docx.v1.model.create_document_block_children_request import (
 from lark_oapi.api.docx.v1.model.create_document_block_children_request_body import (
     CreateDocumentBlockChildrenRequestBody,
 )
+from lark_oapi.api.docx.v1.model.convert_document_request import ConvertDocumentRequest
+from lark_oapi.api.docx.v1.model.convert_document_request_body import ConvertDocumentRequestBody
 from lark_oapi.api.docx.v1.model.create_document_block_descendant_request import (
     CreateDocumentBlockDescendantRequest,
 )
@@ -59,7 +61,6 @@ from .constants import (
     DOCX_BLOCK_TYPE_IMAGE,
     TABLE_FULL_WIDTH,
 )
-from .parser import parse_md_to_blocks
 from .inline import parse_inline
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,9 @@ def _markdown_image_fallback(content: BlockContent) -> str:
         return ""
     alt = str(content.get("alt") or "").strip()
     path = str(content.get("path") or "").strip()
-    return f"![{alt}]({path})" if path else alt
+    if alt and path:
+        return f"{alt}: {path}"
+    return path or alt
 
 
 def _resolve_image_path(image_path: str, base_dir: Path | None) -> Path | None:
@@ -356,6 +359,123 @@ def _create_block_child(client, document_id: str, index: int, block: Block):
         .build()
     )
     return client.docx.v1.document_block_children.create(add_req)
+
+
+def _create_block_descendants(
+    client,
+    document_id: str,
+    index: int,
+    children_id: list[str],
+    descendants: list[Block],
+):
+    add_req = (
+        CreateDocumentBlockDescendantRequest.builder()
+        .document_id(document_id)
+        .block_id(document_id)
+        .document_revision_id(-1)
+        .request_body(
+            CreateDocumentBlockDescendantRequestBody.builder()
+            .children_id(children_id)
+            .descendants(descendants)
+            .index(index)
+            .build()
+        )
+        .build()
+    )
+    return client.docx.v1.document_block_descendant.create(add_req)
+
+
+def _strip_table_merge_info(blocks: list[Block]) -> None:
+    for block in blocks:
+        table = getattr(block, "table", None)
+        if table is None:
+            continue
+        table_property = getattr(table, "property", None)
+        if table_property is not None:
+            table_property.merge_info = None
+
+
+def _parse_markdown_image_line(line: str) -> dict[str, str] | None:
+    stripped = line.strip()
+    match = re.fullmatch(r"!\[([^\]]*)\]\(([^)]+)\)", stripped)
+    if not match:
+        return None
+    return {"alt": match.group(1).strip(), "path": match.group(2).strip()}
+
+
+def _split_markdown_segments(
+    md_content: str,
+    base_dir: Path | None,
+) -> list[tuple[str, BlockContent]]:
+    segments: list[tuple[str, BlockContent]] = []
+    markdown_lines: list[str] = []
+
+    def flush_markdown() -> None:
+        if not markdown_lines:
+            return
+        markdown = "\n".join(markdown_lines).strip()
+        markdown_lines.clear()
+        if markdown:
+            segments.append(("markdown", markdown))
+
+    for line in md_content.split("\n"):
+        image = _parse_markdown_image_line(line)
+        if image is not None:
+            flush_markdown()
+            segments.append(("image", image))
+            continue
+        markdown_lines.append(line)
+
+    flush_markdown()
+    return segments
+
+
+def _insert_markdown_chunk(
+    client,
+    document_id: str,
+    index: int,
+    markdown: str,
+) -> int:
+    if not markdown.strip():
+        return 0
+
+    convert_req = (
+        ConvertDocumentRequest.builder()
+        .request_body(
+            ConvertDocumentRequestBody.builder()
+            .content_type("markdown")
+            .content(markdown)
+            .build()
+        )
+        .build()
+    )
+    convert_resp = client.docx.v1.document.convert(convert_req)
+    if getattr(convert_resp, "code", 0) != 0:
+        logger.warning(
+            "Convert markdown failed at index %s: %s %s",
+            index,
+            getattr(convert_resp, "code"),
+            getattr(convert_resp, "msg"),
+        )
+        return 0
+
+    data = getattr(convert_resp, "data", None)
+    first_level_ids = list(getattr(data, "first_level_block_ids", None) or [])
+    descendants = list(getattr(data, "blocks", None) or [])
+    if not first_level_ids or not descendants:
+        return 0
+
+    _strip_table_merge_info(descendants)
+    add_resp = _create_block_descendants(client, document_id, index, first_level_ids, descendants)
+    if getattr(add_resp, "code", 0) != 0:
+        logger.warning(
+            "Add markdown descendants failed at index %s: %s %s",
+            index,
+            getattr(add_resp, "code"),
+            getattr(add_resp, "msg"),
+        )
+        return 0
+    return len(first_level_ids)
 
 
 def _insert_image_block(
@@ -480,39 +600,23 @@ def create_summary_doc(
         document_id = getattr(doc, "document_id")
         if not document_id:
             return None
-        parsed = parse_md_to_blocks(md_content)
-        if not parsed:
-            parsed = [(DOCX_BLOCK_TYPE_TEXT, md_content.strip() or "（无内容）")]
         resolved_base_dir = Path(base_dir).resolve() if base_dir is not None else None
-        for index, (btype, content) in enumerate(parsed):
-            if btype == DOCX_BLOCK_TYPE_TABLE and isinstance(content, dict) and content.get("rows"):
-                descendant_body = _build_table_descendant_body(content["rows"], index)
-                if descendant_body is None:
-                    continue
-                add_req = (
-                    CreateDocumentBlockDescendantRequest.builder()
-                    .document_id(document_id)
-                    .block_id(document_id)
-                    .document_revision_id(-1)
-                    .request_body(descendant_body)
-                    .build()
-                )
-                add_resp = client.docx.v1.document_block_descendant.create(add_req)
-            else:
-                if btype == DOCX_BLOCK_TYPE_IMAGE:
-                    if _insert_image_block(client, document_id, index, content, resolved_base_dir):
-                        continue
-                    content = _markdown_image_fallback(content) or "（图片上传失败）"
-                    btype = DOCX_BLOCK_TYPE_TEXT
-                block = build_block(btype, content)
-                add_resp = _create_block_child(client, document_id, index, block)
-            if getattr(add_resp, "code", 0) != 0:
-                logger.warning(
-                    "Add block failed at index %s: %s %s",
-                    index,
-                    getattr(add_resp, "code"),
-                    getattr(add_resp, "msg"),
-                )
+        segments = _split_markdown_segments(md_content, resolved_base_dir)
+        if not segments:
+            segments = [("markdown", md_content.strip() or "（无内容）")]
+
+        insert_index = 0
+        for segment_type, content in segments:
+            if segment_type == "markdown":
+                insert_index += _insert_markdown_chunk(client, document_id, insert_index, str(content))
+                continue
+
+            if _insert_image_block(client, document_id, insert_index, content, resolved_base_dir):
+                insert_index += 1
+                continue
+
+            fallback = _markdown_image_fallback(content) or "（图片上传失败）"
+            insert_index += _insert_markdown_chunk(client, document_id, insert_index, fallback)
         return document_id
     except Exception as e:
         logger.exception("Create summary doc failed: %s", e)
