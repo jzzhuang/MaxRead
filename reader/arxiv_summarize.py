@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-For an arXiv link: download TeX source, unzip into data/, ask Claude to summarize
-the paper in one sentence (saved to summarize.txt), and print the result.
-Uses API key from ~/.claude/settings.json (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY).
+For an arXiv link: download TeX source, unzip into data/, launch the Claude CLI
+in that folder so it can read the files and write a one-sentence summary to
+summarize.txt, then print the result.
+Requires the `claude` command (Claude Code) to be installed and authenticated.
 """
 import argparse
-import json
-import os
 import re
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -16,15 +16,36 @@ from pathlib import Path
 
 # ArXiv requires a descriptive User-Agent
 USER_AGENT = "MaxRead-arxiv-summarize/1.0 (mailto:research@example.com)"
-SETTINGS_PATH = Path(os.path.expanduser("~/.claude/settings.json"))
 DATA_DIR = Path(__file__).resolve().parent / "data"
-MAX_TEX_CHARS = 150_000  # Limit context size for Claude
+SUMMARY_PROMPT = "Summarize the paper in this folder into one sentence and write it to summarize.txt"
+
+
+# Bare arXiv id: YYMM.NNNNN or YYMM.NNNNNvN
+_ARXIV_BARE_RE = re.compile(r"(?:^|[^\w.])(\d{4}\.\d{4,5}(?:v\d+)?)(?=[^\d]|$)")
+_ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf|e-print)/([^/?#\s]+)", re.I)
 
 
 def arxiv_id_from_url(url: str) -> str | None:
     """Extract arXiv id from abs/pdf/e-print URL. E.g. 2301.12345 or 2301.12345v2."""
-    m = re.search(r"arxiv\.org/(?:abs|pdf|e-print)/([^/?#]+)", url, re.I)
+    m = _ARXIV_URL_RE.search(url)
     return m.group(1).strip() if m else None
+
+
+def extract_arxiv_ids(text: str) -> list[str]:
+    """Extract all arXiv ids from text: full URLs and bare ids like 2301.12345."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _ARXIV_URL_RE.finditer(text):
+        aid = m.group(1).strip()
+        if aid not in seen:
+            seen.add(aid)
+            out.append(aid)
+    for m in _ARXIV_BARE_RE.finditer(text):
+        aid = m.group(1).strip()
+        if aid not in seen:
+            seen.add(aid)
+            out.append(aid)
+    return out
 
 
 def download_source(arxiv_id: str) -> Path:
@@ -59,91 +80,54 @@ def extract_archive(archive_path: Path, out_dir: Path) -> None:
         raise ValueError("Unknown archive format (expected .tar.gz or .zip)")
 
 
-def collect_tex_content(tex_dir: Path) -> str:
-    """Gather .tex file contents, preferring main.tex. Truncate to MAX_TEX_CHARS."""
-    tex_dir = Path(tex_dir)
-    tex_files = sorted(tex_dir.rglob("*.tex"))
-    main_tex = tex_dir / "main.tex"
-    if main_tex.exists():
-        order = [main_tex] + [p for p in tex_files if p != main_tex]
-    else:
-        order = tex_files
-    parts = []
-    total = 0
-    for p in order:
-        if total >= MAX_TEX_CHARS:
-            break
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-        take = min(len(text), MAX_TEX_CHARS - total)
-        parts.append(f"--- {p.relative_to(tex_dir)} ---\n{text[:take]}")
-        total += take
-    return "\n\n".join(parts) if parts else ""
-
-
-def load_claude_settings() -> dict:
-    """Load env from ~/.claude/settings.json."""
-    if not SETTINGS_PATH.exists():
-        return {}
-    try:
-        with open(SETTINGS_PATH) as f:
-            return (json.load(f).get("env") or {})
-    except Exception:
-        return {}
-
-
-def summarize_with_claude(tex_content: str, paper_dir: Path) -> str:
-    """Call Claude to summarize the paper in one sentence; return that sentence."""
-    env = load_claude_settings()
-    api_key = (
-        env.get("ANTHROPIC_AUTH_TOKEN")
-        or env.get("ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        or ""
-    ).strip()
-    if not api_key:
-        raise SystemExit(
-            "No ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY in ~/.claude/settings.json or env."
+def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
+    """
+    Launch the Claude CLI in paper_dir with the given prompt. Claude can read
+    files in that folder and write summarize.txt. Returns the content of
+    summarize.txt after Claude exits.
+    """
+    paper_dir = Path(paper_dir).resolve()
+    out_file = paper_dir / "summarize.txt"
+    out_file.unlink(missing_ok=True)
+    proc = subprocess.run(
+        ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"],
+        cwd=str(paper_dir),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        raise RuntimeError(f"claude command failed: {err}")
+    if not out_file.exists():
+        cmd = f'cd {paper_dir!r} && claude -p {prompt!r} --permission-mode bypassPermissions'
+        raise FileNotFoundError(
+            f"Claude did not create summarize.txt in {paper_dir}. stdout: {(proc.stdout or '')[:500]}\n\n"
+            f"Run this in your terminal to run Claude directly:\n  {cmd}"
         )
-    base_url = (env.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
-    model = env.get("ANTHROPIC_MODEL") or os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514"
+    return out_file.read_text(encoding="utf-8").strip()
 
-    import anthropic
-    client_kwargs = {"api_key": api_key}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    client = anthropic.Anthropic(**client_kwargs)
 
-    system = (
-        "You are given the TeX source of an academic paper. "
-        "Reply with exactly one sentence that summarizes the paper. "
-        "Do not include quotes, prefixes, or extra text—only the one-sentence summary."
-    )
-    user = (
-        "Summarize the following paper in one sentence. "
-        "Your reply will be saved to summarize.txt.\n\n"
-        + (tex_content or "(No .tex content found)")
-    )
-    message = client.messages.create(
-        model=model,
-        max_tokens=256,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    summary = ""
-    for block in message.content:
-        if getattr(block, "type", None) == "text":
-            summary += (getattr(block, "text", "") or "")
-    summary = summary.strip()
-    (paper_dir / "summarize.txt").write_text(summary, encoding="utf-8")
-    return summary
+def run_summarize(arxiv_id: str, data_dir: Path | None = None) -> str:
+    """
+    Download arXiv source, extract to data_dir/<id>/, launch Claude CLI in that
+    folder to summarize and write summarize.txt. Returns the one-sentence summary.
+    """
+    data_dir = data_dir or DATA_DIR
+    data_dir.mkdir(parents=True, exist_ok=True)
+    paper_dir = data_dir / arxiv_id.replace("/", "_")
+    archive_path = download_source(arxiv_id)
+    try:
+        extract_archive(archive_path, paper_dir)
+    finally:
+        archive_path.unlink(missing_ok=True)
+    return launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download arXiv TeX source and summarize with Claude.")
+    parser = argparse.ArgumentParser(
+        description="Download arXiv TeX source, launch Claude in that folder to summarize."
+    )
     parser.add_argument("url", help="arXiv URL (e.g. https://arxiv.org/abs/2301.12345)")
     args = parser.parse_args()
 
@@ -164,9 +148,8 @@ def main() -> None:
     finally:
         archive_path.unlink(missing_ok=True)
 
-    tex_content = collect_tex_content(paper_dir)
-    print("Asking Claude for a one-sentence summary...")
-    summary = summarize_with_claude(tex_content, paper_dir)
+    print("Launching Claude in folder (reads files and writes summarize.txt)...")
+    summary = launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
     print("Summary (saved to summarize.txt):")
     print(summary)
 
