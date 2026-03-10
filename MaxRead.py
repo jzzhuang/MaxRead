@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Listen to Feishu; for any message containing an arXiv link (URL or bare id),
-download the TeX source, summarize with Claude, create a cloud doc (云文档) with
-the one-sentence summary, and reply with the summary and doc link.
+download the TeX source, summarize with Claude (output: concise Markdown in summarize.md),
+create a cloud doc (云文档) with sections, paragraphs, and equations, and reply with the summary and doc link.
 
   python MaxRead.py
 
@@ -22,21 +22,10 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
 from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
-from lark_oapi.api.docx.v1.model.create_document_request import CreateDocumentRequest
-from lark_oapi.api.docx.v1.model.create_document_request_body import CreateDocumentRequestBody
-from lark_oapi.api.docx.v1.model.create_document_block_children_request import (
-    CreateDocumentBlockChildrenRequest,
-)
-from lark_oapi.api.docx.v1.model.create_document_block_children_request_body import (
-    CreateDocumentBlockChildrenRequestBody,
-)
-from lark_oapi.api.docx.v1.model.block import Block
-from lark_oapi.api.docx.v1.model.text import Text
-from lark_oapi.api.docx.v1.model.text_element import TextElement
-from lark_oapi.api.docx.v1.model.text_run import TextRun
 
 from feishu.config import get_config
 from reader.arxiv_summarize import extract_arxiv_ids, run_summarize
+from transform.feishu_doc import create_summary_doc, doc_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,71 +34,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MaxRead")
 
-# block_type 2 = text (paragraph) in Feishu docx
-DOCX_BLOCK_TYPE_TEXT = 2
-
 # HTTP client (built in main)
 _feishu_client = None
 
 # Deduplicate by message_id (Feishu may deliver the same message event more than once)
 _MAX_PROCESSED_IDS = 5000
 _processed_message_ids: set[str] = set()
-
-
-def _create_summary_doc(client, title: str, summary: str) -> str | None:
-    """Create a cloud doc (云文档) with the summary text. Returns document_id or None."""
-    try:
-        body = (
-            CreateDocumentRequestBody.builder()
-            .folder_token("")
-            .title(title)
-            .build()
-        )
-        req = CreateDocumentRequest.builder().request_body(body).build()
-        resp = client.docx.v1.document.create(req)
-        if getattr(resp, "code", 0) != 0:
-            logger.warning("Create doc failed: %s %s", getattr(resp, "code"), getattr(resp, "msg"))
-            return None
-        doc = getattr(resp, "data") and getattr(resp.data, "document")
-        if not doc:
-            return None
-        document_id = getattr(doc, "document_id")
-        if not document_id:
-            return None
-        # Add one paragraph with the summary
-        text_run = TextRun.builder().content(summary).build()
-        text_element = TextElement.builder().text_run(text_run).build()
-        text_block = Text.builder().elements([text_element]).build()
-        block = Block.builder().block_type(DOCX_BLOCK_TYPE_TEXT).text(text_block).build()
-        children_body = (
-            CreateDocumentBlockChildrenRequestBody.builder()
-            .children([block])
-            .index(0)
-            .build()
-        )
-        add_req = (
-            CreateDocumentBlockChildrenRequest.builder()
-            .document_id(document_id)
-            .block_id(document_id)
-            .request_body(children_body)
-            .build()
-        )
-        add_resp = client.docx.v1.document_block_children.create(add_req)
-        if getattr(add_resp, "code", 0) != 0:
-            logger.warning("Add block failed: %s %s", getattr(add_resp, "code"), getattr(add_resp, "msg"))
-        return document_id
-    except Exception as e:
-        logger.exception("Create summary doc failed: %s", e)
-        return None
-
-
-def _doc_url(document_id: str, tenant_key: str | None = None) -> str:
-    """Return the Feishu doc open link (opens in Feishu client or browser).
-    open.feishu.cn is API-only; user-facing links must use tenant domain, e.g. https://<tenant>.feishu.cn/docx/<id>.
-    """
-    if tenant_key:
-        return f"https://{tenant_key}.feishu.cn/docx/{document_id}"
-    return f"https://open.feishu.cn/docx/{document_id}"
 
 
 def _reply_to_message(message_id: str, text: str) -> None:
@@ -174,10 +104,10 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         try:
             summary = run_summarize(arxiv_id, data_dir=ROOT / "reader" / "data")
             title = f"arXiv {arxiv_id} 摘要"
-            doc_id = _create_summary_doc(_feishu_client, title, summary) if _feishu_client else None
+            doc_id = create_summary_doc(_feishu_client, title, summary) if _feishu_client else None
             if doc_id:
                 tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
-                reply_text = f"已创建云文档「{title}」，内容：\n\n{summary}\n\n👉 打开文档：{_doc_url(doc_id, tenant_key)}"
+                reply_text = f"已创建云文档「{title}」，内容：\n\n{summary}\n\n👉 打开文档：{doc_url(doc_id, tenant_key)}"
             else:
                 reply_text = f"[arXiv {arxiv_id}]\n{summary}"
             _reply_to_message(message_id, reply_text)

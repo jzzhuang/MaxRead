@@ -1,0 +1,1 @@
+python -m transform reader/data/2512.16248/summarize.md --feishu --tenant vrfi1sk8a0

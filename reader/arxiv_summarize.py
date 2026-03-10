@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 For an arXiv link: download TeX source, unzip into data/, launch the Claude CLI
-in that folder so it can read the files and write a one-sentence summary to
-summarize.txt, then print the result.
+in that folder so it can read the files and write a concise summary to
+summarize.md (Markdown with sections, paragraphs, and LaTeX equations in $$...$$),
+then print the result.
 Requires the `claude` command (Claude Code) to be installed and authenticated.
 """
 import argparse
@@ -17,7 +18,14 @@ from pathlib import Path
 # ArXiv requires a descriptive User-Agent
 USER_AGENT = "MaxRead-arxiv-summarize/1.0 (mailto:research@example.com)"
 DATA_DIR = Path(__file__).resolve().parent / "data"
-SUMMARY_PROMPT = "Summarize the paper in this folder into one sentence and write it to summarize.txt"
+SUMMARY_PROMPT = """Summarize the paper in this folder concisely and write the result to summarize.md.
+
+Requirements:
+- Output file: summarize.md (Markdown).
+- Use clear sections with ## or ### headings (e.g. ## Summary, ## Method, ## Key results).
+- Use short paragraphs of plain text.
+- For important math, use LaTeX in display form: $$...$$ for block equations, or \\( ... \\) for inline.
+- Keep the summary concise but informative (a few short sections, not a full rewrite)."""
 
 
 # Bare arXiv id: YYMM.NNNNN or YYMM.NNNNNvN
@@ -83,11 +91,11 @@ def extract_archive(archive_path: Path, out_dir: Path) -> None:
 def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     """
     Launch the Claude CLI in paper_dir with the given prompt. Claude can read
-    files in that folder and write summarize.txt. Returns the content of
-    summarize.txt after Claude exits.
+    files in that folder and write summarize.md. Returns the content of
+    summarize.md after Claude exits.
     """
     paper_dir = Path(paper_dir).resolve()
-    out_file = paper_dir / "summarize.txt"
+    out_file = paper_dir / "summarize.md"
     out_file.unlink(missing_ok=True)
     proc = subprocess.run(
         ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"],
@@ -102,7 +110,7 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     if not out_file.exists():
         cmd = f'cd {paper_dir!r} && claude -p {prompt!r} --permission-mode bypassPermissions'
         raise FileNotFoundError(
-            f"Claude did not create summarize.txt in {paper_dir}. stdout: {(proc.stdout or '')[:500]}\n\n"
+            f"Claude did not create summarize.md in {paper_dir}. stdout: {(proc.stdout or '')[:500]}\n\n"
             f"Run this in your terminal to run Claude directly:\n  {cmd}"
         )
     return out_file.read_text(encoding="utf-8").strip()
@@ -111,7 +119,7 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
 def run_summarize(arxiv_id: str, data_dir: Path | None = None) -> str:
     """
     Download arXiv source, extract to data_dir/<id>/, launch Claude CLI in that
-    folder to summarize and write summarize.txt. Returns the one-sentence summary.
+    folder to summarize and write summarize.md. Returns the Markdown summary.
     """
     data_dir = data_dir or DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -148,9 +156,9 @@ def main() -> None:
     finally:
         archive_path.unlink(missing_ok=True)
 
-    print("Launching Claude in folder (reads files and writes summarize.txt)...")
+    print("Launching Claude in folder (reads files and writes summarize.md)...")
     summary = launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
-    print("Summary (saved to summarize.txt):")
+    print("Summary (saved to summarize.md):")
     print(summary)
 
 
