@@ -15,7 +15,7 @@ from .constants import (
 )
 from .parser import parse_md_to_blocks
 from .inline import parse_inline
-from .feishu_doc import build_block, create_summary_doc, doc_url
+from .feishu_doc import create_summary_doc, doc_url
 
 __all__ = [
     "DOCX_BLOCK_TYPE_TEXT",
@@ -30,7 +30,6 @@ __all__ = [
     "DOCX_BLOCK_TYPE_CODE",
     "parse_md_to_blocks",
     "parse_inline",
-    "build_block",
     "create_summary_doc",
     "doc_url",
 ]

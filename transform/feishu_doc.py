@@ -8,19 +8,10 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from uuid import uuid4
-from typing import Any, Union
+from typing import Union
 
 from lark_oapi.api.docx.v1.model.block import Block
 from lark_oapi.api.docx.v1.model.image import Image
-from lark_oapi.api.docx.v1.model.text import Text
-from lark_oapi.api.docx.v1.model.text_element import TextElement
-from lark_oapi.api.docx.v1.model.text_run import TextRun
-from lark_oapi.api.docx.v1.model.text_element_style import TextElementStyle
-from lark_oapi.api.docx.v1.model.divider import Divider
-from lark_oapi.api.docx.v1.model.equation import Equation
-from lark_oapi.api.docx.v1.model.table import Table
-from lark_oapi.api.docx.v1.model.table_property import TableProperty
 from lark_oapi.api.docx.v1.model.create_document_request import CreateDocumentRequest
 from lark_oapi.api.docx.v1.model.create_document_request_body import CreateDocumentRequestBody
 from lark_oapi.api.docx.v1.model.create_document_block_children_request import (
@@ -42,249 +33,18 @@ from lark_oapi.api.docx.v1.model.patch_document_block_request import (
 )
 from lark_oapi.api.docx.v1.model.replace_image_request import ReplaceImageRequest
 from lark_oapi.api.docx.v1.model.update_block_request import UpdateBlockRequest
-from lark_oapi.api.docx.v1.model.table_cell import TableCell
 from lark_oapi.api.drive.v1.model.upload_all_media_request import UploadAllMediaRequest
 from lark_oapi.api.drive.v1.model.upload_all_media_request_body import (
     UploadAllMediaRequestBody,
 )
 
 from .constants import (
-    DOCX_BLOCK_TYPE_TEXT,
-    DOCX_BLOCK_TYPE_HEADING1,
-    DOCX_BLOCK_TYPE_HEADING2,
-    DOCX_BLOCK_TYPE_HEADING3,
-    DOCX_BLOCK_TYPE_EQUATION,
-    DOCX_BLOCK_TYPE_BULLET,
-    DOCX_BLOCK_TYPE_ORDERED,
-    DOCX_BLOCK_TYPE_DIVIDER,
-    DOCX_BLOCK_TYPE_TABLE,
     DOCX_BLOCK_TYPE_IMAGE,
-    TABLE_FULL_WIDTH,
 )
-from .inline import parse_inline
 
 logger = logging.getLogger(__name__)
 
-BlockContent = Union[str, dict[str, Any]]
-INLINE_EQUATION_RE = re.compile(
-    r"""
-    \$\$(?P<display_dollar>.+?)\$\$
-    |\\\[(?P<display_bracket>.+?)\\\]
-    |\\\((?P<inline_paren>.+?)\\\)
-    |(?<!\$)\$(?!\$)(?P<inline_dollar>.+?)(?<!\$)\$(?!\$)
-    """,
-    re.VERBOSE | re.DOTALL,
-)
-
-
-def _build_text_elements(content: str) -> list:
-    """Build list of TextElement from content string, parsing **bold** and *italic*."""
-    segments = parse_inline(content)
-    elements = []
-    for seg in segments:
-        text = seg["text"]
-        if not text:
-            continue
-        style = TextElementStyle.builder()
-        if seg.get("bold"):
-            style.bold(True)
-        if seg.get("italic"):
-            style.italic(True)
-        run = TextRun.builder().content(text)
-        if seg.get("bold") or seg.get("italic"):
-            run = run.text_element_style(style.build())
-        elements.append(TextElement.builder().text_run(run.build()).build())
-    if not elements:
-        elements = [
-            TextElement.builder()
-            .text_run(TextRun.builder().content(" ").build())
-            .build()
-        ]
-    return elements
-
-
-def _build_text_elements_with_inline_equations(content: str) -> list:
-    """Build TextElements from content with common inline/display LaTeX syntax."""
-    if not content:
-        return [
-            TextElement.builder()
-            .text_run(TextRun.builder().content(" ").build())
-            .build()
-        ]
-    elements: list = []
-    cursor = 0
-    for match in INLINE_EQUATION_RE.finditer(content):
-        text_part = content[cursor : match.start()]
-        if text_part:
-            elements.extend(_build_text_elements(text_part))
-
-        eq_content = next(
-            (group.strip() for group in match.groupdict().values() if group and group.strip()),
-            "",
-        )
-        if eq_content:
-            eq = Equation.builder().content(eq_content).build()
-            elements.append(TextElement.builder().equation(eq).build())
-        cursor = match.end()
-
-    trailing_text = content[cursor:]
-    if trailing_text:
-        elements.extend(_build_text_elements(trailing_text))
-
-    if not elements:
-        elements = [
-            TextElement.builder()
-            .text_run(TextRun.builder().content(" ").build())
-            .build()
-        ]
-    return elements
-
-
-def build_block(block_type: int, content: BlockContent) -> Block:
-    """Build a Feishu Block from block_type and content (string or table dict)."""
-    # Equation is a Text Block (type 2) with one equation element (per Feishu doc)
-    if block_type == DOCX_BLOCK_TYPE_EQUATION:
-        eq_content = (content if isinstance(content, str) else "").strip()
-        eq = Equation.builder().content(eq_content).build()
-        elem = TextElement.builder().equation(eq).build()
-        text_obj = Text.builder().elements([elem]).build()
-        return Block.builder().block_type(DOCX_BLOCK_TYPE_TEXT).text(text_obj).build()
-
-    if block_type == DOCX_BLOCK_TYPE_TABLE:
-        if not isinstance(content, dict) or "rows" not in content:
-            text_obj = Text.builder().elements([
-                TextElement.builder().text_run(TextRun.builder().content(" ").build()).build()
-            ]).build()
-            return Block.builder().block_type(DOCX_BLOCK_TYPE_TEXT).text(text_obj).build()
-        rows = content["rows"]
-        if not rows:
-            text_obj = Text.builder().elements([
-                TextElement.builder().text_run(TextRun.builder().content(" ").build()).build()
-            ]).build()
-            return Block.builder().block_type(DOCX_BLOCK_TYPE_TEXT).text(text_obj).build()
-        row_count = len(rows)
-        col_count = max(len(r) for r in rows) if rows else 0
-        if col_count == 0:
-            text_obj = Text.builder().elements([
-                TextElement.builder().text_run(TextRun.builder().content(" ").build()).build()
-            ]).build()
-            return Block.builder().block_type(DOCX_BLOCK_TYPE_TEXT).text(text_obj).build()
-        # Equal column widths so table spans document content width on desktop
-        width_per_col = TABLE_FULL_WIDTH // col_count
-        column_widths = [width_per_col] * col_count
-        # Add remainder to first column so total equals TABLE_FULL_WIDTH
-        column_widths[0] += TABLE_FULL_WIDTH - sum(column_widths)
-        table_prop = (
-            TableProperty.builder()
-            .row_size(row_count)
-            .column_size(col_count)
-            .column_width(column_widths)
-            .header_row(True)
-            .build()
-        )
-        table = Table.builder().property(table_prop).cells([]).build()
-        return Block.builder().block_type(DOCX_BLOCK_TYPE_TABLE).table(table).build()
-
-    if block_type == DOCX_BLOCK_TYPE_IMAGE:
-        return Block.builder().block_type(DOCX_BLOCK_TYPE_IMAGE).image(Image.builder().build()).build()
-
-    if block_type == DOCX_BLOCK_TYPE_DIVIDER:
-        return Block.builder().block_type(DOCX_BLOCK_TYPE_DIVIDER).divider(Divider.builder().build()).build()
-
-    # Text, heading, bullet, ordered: content may contain **, *, and inline LaTeX.
-    text_str = content if isinstance(content, str) else ""
-    text_obj = Text.builder().elements(_build_text_elements_with_inline_equations(text_str or " ")).build()
-    builder = Block.builder().block_type(block_type)
-
-    if block_type == DOCX_BLOCK_TYPE_HEADING1:
-        return builder.heading1(text_obj).build()
-    if block_type == DOCX_BLOCK_TYPE_HEADING2:
-        return builder.heading2(text_obj).build()
-    if block_type == DOCX_BLOCK_TYPE_HEADING3:
-        return builder.heading3(text_obj).build()
-    if block_type == DOCX_BLOCK_TYPE_BULLET:
-        return builder.bullet(text_obj).build()
-    if block_type == DOCX_BLOCK_TYPE_ORDERED:
-        return builder.ordered(text_obj).build()
-    return builder.text(text_obj).build()
-
-
-def _build_table_descendant_body(
-    rows: list[list[str]], index: int
-) -> CreateDocumentBlockDescendantRequestBody | None:
-    """Build a nested table payload so cell content is created with the table itself."""
-    if not rows:
-        return None
-    row_count = len(rows)
-    col_count = max(len(r) for r in rows) if rows else 0
-    if row_count == 0 or col_count == 0:
-        return None
-
-    width_per_col = TABLE_FULL_WIDTH // col_count
-    column_widths = [width_per_col] * col_count
-    column_widths[0] += TABLE_FULL_WIDTH - sum(column_widths)
-
-    table_id = f"tbl_{uuid4().hex}"
-    descendants: list[Block] = []
-    cell_ids: list[str] = []
-
-    for row in rows:
-        padded_row = [str(c).strip() for c in row] + [""] * (col_count - len(row))
-        for raw_cell in padded_row[:col_count]:
-            cell_id = f"cell_{uuid4().hex}"
-            normalized = raw_cell.replace("\n", " ").replace("\r", " ").strip()
-            child_ids: list[str] = []
-            cell_descendants: list[Block] = []
-
-            if normalized:
-                text_block_id = f"cell_text_{uuid4().hex}"
-                text_block = (
-                    Block.builder()
-                    .block_id(text_block_id)
-                    .block_type(DOCX_BLOCK_TYPE_TEXT)
-                    .text(Text.builder().elements(_build_text_elements_with_inline_equations(normalized)).build())
-                    .children([])
-                    .build()
-                )
-                cell_descendants.append(text_block)
-                child_ids.append(text_block_id)
-
-            cell_block = (
-                Block.builder()
-                .block_id(cell_id)
-                .block_type(32)
-                .table_cell(TableCell.builder().build())
-                .children(child_ids)
-                .build()
-            )
-            descendants.append(cell_block)
-            descendants.extend(cell_descendants)
-            cell_ids.append(cell_id)
-
-    table_prop = (
-        TableProperty.builder()
-        .row_size(row_count)
-        .column_size(col_count)
-        .column_width(column_widths)
-        .header_row(True)
-        .build()
-    )
-    table_block = (
-        Block.builder()
-        .block_id(table_id)
-        .block_type(DOCX_BLOCK_TYPE_TABLE)
-        .table(Table.builder().property(table_prop).cells(cell_ids).build())
-        .children(cell_ids)
-        .build()
-    )
-    descendants.insert(0, table_block)
-    return (
-        CreateDocumentBlockDescendantRequestBody.builder()
-        .children_id([table_id])
-        .descendants(descendants)
-        .index(index)
-        .build()
-    )
+BlockContent = Union[str, dict[str, str]]
 
 
 def _markdown_image_fallback(content: BlockContent) -> str:
@@ -405,7 +165,6 @@ def _parse_markdown_image_line(line: str) -> dict[str, str] | None:
 
 def _split_markdown_segments(
     md_content: str,
-    base_dir: Path | None,
 ) -> list[tuple[str, BlockContent]]:
     segments: list[tuple[str, BlockContent]] = []
     markdown_lines: list[str] = []
@@ -497,7 +256,8 @@ def _insert_image_block(
         logger.warning("Image file not found for Feishu upload: %s", raw_path)
         return False
 
-    create_resp = _create_block_child(client, document_id, index, build_block(DOCX_BLOCK_TYPE_IMAGE, content))
+    image_block = Block.builder().block_type(DOCX_BLOCK_TYPE_IMAGE).image(Image.builder().build()).build()
+    create_resp = _create_block_child(client, document_id, index, image_block)
     if getattr(create_resp, "code", 0) != 0:
         logger.warning(
             "Create image block failed at index %s: %s %s",
@@ -601,7 +361,7 @@ def create_summary_doc(
         if not document_id:
             return None
         resolved_base_dir = Path(base_dir).resolve() if base_dir is not None else None
-        segments = _split_markdown_segments(md_content, resolved_base_dir)
+        segments = _split_markdown_segments(md_content)
         if not segments:
             segments = [("markdown", md_content.strip() or "（无内容）")]
 

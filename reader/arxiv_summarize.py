@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-For an arXiv link: download TeX source, unzip into data/, launch the Claude CLI
-in that folder so it can read the files and write a concise summary to
-summarize.md (Markdown with sections, paragraphs, and LaTeX equations),
-then print the result.
-Requires the `claude` command (Claude Code) to be installed and authenticated.
+For an arXiv link: download TeX source, unzip into data/, launch an AI agent
+(Claude CLI or Cursor agent) in that folder to read the files and write a
+concise summary to summarize.md (Markdown with sections, paragraphs, and LaTeX
+equations), then print the result.
+
+Modes:
+  claude: requires the `claude` command (Claude Code) to be installed.
+  cursor (default): requires the Cursor `agent` command to be installed and authenticated.
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -18,19 +22,34 @@ from pathlib import Path
 # ArXiv requires a descriptive User-Agent
 USER_AGENT = "MaxRead-arxiv-summarize/1.0 (mailto:research@example.com)"
 DATA_DIR = Path(__file__).resolve().parent / "data"
-SUMMARY_PROMPT = """请阅读此文件夹中的论文内容，并将结果写入 summarize.md。
+PROMPT_FILE = Path(__file__).resolve().parent / "prompt.txt"
+CURSOR_KEY_FILE = Path(__file__).resolve().parent.parent / "cursor_api_key.txt"
 
-要求：
-- 所有输出内容必须全部使用中文。
-- 输出文件必须是 summarize.md（Markdown 格式）。
-- 内容要写得详尽、完整，不要只写简短摘要。需要系统介绍论文的研究问题、背景动机、核心方法、实验设置、主要结果、局限性与结论。
-- 使用清晰的 ## 或 ### 标题组织内容。
-- 以较完整的中文段落进行说明，避免只有零散的要点式罗列。
-- 对重要公式使用标准 LaTeX 表达，支持常见形式如 $...$、$$...$$、\\( ... \\)、\\[ ... \\] 等。
-- 尤其要重视论文中的图片、表格、可视化内容。对论文中的每一张图片、表格都要单独保留，并配上中文说明，解释该图展示了什么、对应论文哪一部分、可以得出哪些关键信息。
-- 论文中的全部图片都必须保留并写入 summarize.md，尽量按照论文中的出现顺序插入，使用 Markdown 图片语法引用本地图片文件。
-- 如果论文中存在表格，也请逐一说明其内容和结论；如果表格能转成 Markdown 表格，也尽量保留在 summarize.md 中。
-- 最终的 summarize.md 应该是一份中文的、内容详尽的论文解读文档，并且包含论文中的全部图片及其说明和表格及其说明。"""
+
+def _load_prompt() -> str:
+    """Load the summarization prompt from reader/prompt.txt."""
+    if not PROMPT_FILE.exists():
+        raise FileNotFoundError(f"Prompt file not found: {PROMPT_FILE}")
+    return PROMPT_FILE.read_text(encoding="utf-8").strip()
+
+
+SUMMARY_PROMPT = _load_prompt()
+
+
+def _resolve_cursor_api_key() -> str | None:
+    """
+    Resolve CURSOR_API_KEY from environment first, then from repo-level
+    cursor_api_key.txt (first non-empty line).
+    """
+    env_key = (os.environ.get("CURSOR_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    if CURSOR_KEY_FILE.exists():
+        for line in CURSOR_KEY_FILE.read_text(encoding="utf-8").splitlines():
+            key = line.strip()
+            if key:
+                return key
+    return None
 
 
 # Bare arXiv id: YYMM.NNNNN or YYMM.NNNNNvN
@@ -95,9 +114,8 @@ def extract_archive(archive_path: Path, out_dir: Path) -> None:
 
 def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     """
-    Launch the Claude CLI in paper_dir with the given prompt. Claude can read
-    files in that folder and write summarize.md. Returns the content of
-    summarize.md after Claude exits.
+    Launch the Claude CLI in paper_dir with the given prompt. Returns the
+    content of summarize.md after Claude exits.
     """
     paper_dir = Path(paper_dir).resolve()
     out_file = paper_dir / "summarize.md"
@@ -121,10 +139,52 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     return out_file.read_text(encoding="utf-8").strip()
 
 
-def run_summarize(arxiv_id: str, data_dir: Path | None = None) -> str:
+def launch_agent_in_folder(paper_dir: Path, prompt: str) -> str:
     """
-    Download arXiv source, extract to data_dir/<id>/, launch Claude CLI in that
-    folder to summarize and write summarize.md. Returns the Markdown summary.
+    Launch the Cursor agent in paper_dir with the given prompt. The agent can
+    read files in that folder and write summarize.md. Returns the content of
+    summarize.md after the agent exits.
+    """
+    paper_dir = Path(paper_dir).resolve()
+    out_file = paper_dir / "summarize.md"
+    out_file.unlink(missing_ok=True)
+    api_key = _resolve_cursor_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Missing CURSOR_API_KEY. Set CURSOR_API_KEY env var or put the key in "
+            f"{CURSOR_KEY_FILE} (first non-empty line)."
+        )
+    env = os.environ.copy()
+    env["CURSOR_API_KEY"] = api_key
+    proc = subprocess.run(
+        ["agent", "-p", prompt, "--workspace", str(paper_dir), "--yolo"],
+        cwd=str(paper_dir),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        raise RuntimeError(f"agent command failed: {err}")
+    if not out_file.exists():
+        cmd = f'agent -p {prompt!r} --workspace {paper_dir!r}'
+        raise FileNotFoundError(
+            f"Agent did not create summarize.md in {paper_dir}. stdout: {(proc.stdout or '')[:500]}\n\n"
+            f"Run this in your terminal to run the agent directly:\n  {cmd}"
+        )
+    return out_file.read_text(encoding="utf-8").strip()
+
+
+def run_summarize(
+    arxiv_id: str,
+    data_dir: Path | None = None,
+    mode: str = "cursor",
+) -> str:
+    """
+    Download arXiv source, extract to data_dir/<id>/, launch the chosen agent
+    (claude or cursor) in that folder to summarize and write summarize.md.
+    Returns the Markdown summary.
     """
     data_dir = data_dir or DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -134,14 +194,22 @@ def run_summarize(arxiv_id: str, data_dir: Path | None = None) -> str:
         extract_archive(archive_path, paper_dir)
     finally:
         archive_path.unlink(missing_ok=True)
+    if mode == "cursor":
+        return launch_agent_in_folder(paper_dir, SUMMARY_PROMPT)
     return launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download arXiv TeX source, launch Claude in that folder to summarize."
+        description="Download arXiv TeX source, launch Claude or Cursor agent in that folder to summarize."
     )
     parser.add_argument("url", help="arXiv URL (e.g. https://arxiv.org/abs/2301.12345)")
+    parser.add_argument(
+        "--mode",
+        choices=("claude", "cursor"),
+        default="cursor",
+        help="Agent to use: cursor (default) or claude",
+    )
     args = parser.parse_args()
 
     arxiv_id = arxiv_id_from_url(args.url)
@@ -161,8 +229,12 @@ def main() -> None:
     finally:
         archive_path.unlink(missing_ok=True)
 
-    print("Launching Claude in folder (reads files and writes summarize.md)...")
-    summary = launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
+    agent_name = "Cursor agent" if args.mode == "cursor" else "Claude"
+    print(f"Launching {agent_name} in folder (reads files and writes summarize.md)...")
+    if args.mode == "cursor":
+        summary = launch_agent_in_folder(paper_dir, SUMMARY_PROMPT)
+    else:
+        summary = launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
     print("Summary (saved to summarize.md):")
     print(summary)
 

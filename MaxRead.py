@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Listen to Feishu; for any message containing an arXiv link (URL or bare id),
-download the TeX source, summarize with Claude (output: concise Markdown in summarize.md),
-create a cloud doc (云文档) with sections, paragraphs, and equations, and reply with the summary and doc link.
+download the TeX source, summarize with Cursor Agent by default
+(output: concise Markdown in summarize.md),
+create a cloud doc (云文档) with sections, paragraphs, and equations, then reply with a short completion message.
 
   python MaxRead.py
 
 Requires: FEISHU_APP_ID, FEISHU_APP_SECRET in feishu/.env;
-  ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY in ~/.claude/settings.json.
+  CURSOR_API_KEY in env or cursor_api_key.txt at repo root.
 """
 import json
 import logging
@@ -20,6 +21,10 @@ sys.path.insert(0, str(ROOT))
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
+from lark_oapi.api.im.v1.model.create_message_reaction_request_body import CreateMessageReactionRequestBody
+from lark_oapi.api.im.v1.model.delete_message_reaction_request import DeleteMessageReactionRequest
+from lark_oapi.api.im.v1.model.emoji import Emoji
 from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
 from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
 
@@ -40,6 +45,7 @@ _feishu_client = None
 # Deduplicate by message_id (Feishu may deliver the same message event more than once)
 _MAX_PROCESSED_IDS = 5000
 _processed_message_ids: set[str] = set()
+_PROCESSING_EMOJI = "OK"
 
 
 def _reply_to_message(message_id: str, text: str) -> None:
@@ -62,6 +68,61 @@ def _reply_to_message(message_id: str, text: str) -> None:
             logger.info("Replied to %s", message_id)
     except Exception as e:
         logger.exception("Failed to reply: %s", e)
+
+
+def _add_processing_reaction(message_id: str) -> str | None:
+    """Add a temporary reaction to indicate processing started."""
+    if not _feishu_client:
+        return None
+    try:
+        body = (
+            CreateMessageReactionRequestBody.builder()
+            .reaction_type(Emoji.builder().emoji_type(_PROCESSING_EMOJI).build())
+            .build()
+        )
+        req = (
+            CreateMessageReactionRequest.builder()
+            .message_id(message_id)
+            .request_body(body)
+            .build()
+        )
+        resp = _feishu_client.im.v1.message_reaction.create(req)
+        if resp and getattr(resp, "code", 0) == 0:
+            reaction_id = getattr(getattr(resp, "data", None), "reaction_id", None)
+            logger.info("Added processing reaction to %s", message_id)
+            return reaction_id
+        logger.warning(
+            "Add reaction API code: %s msg: %s",
+            getattr(resp, "code", None),
+            getattr(resp, "msg", ""),
+        )
+    except Exception as e:
+        logger.warning("Failed to add reaction for %s: %s", message_id, e)
+    return None
+
+
+def _remove_processing_reaction(message_id: str, reaction_id: str | None) -> None:
+    """Remove the temporary processing reaction."""
+    if not _feishu_client or not reaction_id:
+        return
+    try:
+        req = (
+            DeleteMessageReactionRequest.builder()
+            .message_id(message_id)
+            .reaction_id(reaction_id)
+            .build()
+        )
+        resp = _feishu_client.im.v1.message_reaction.delete(req)
+        if resp and getattr(resp, "code", 0) != 0:
+            logger.warning(
+                "Delete reaction API code: %s msg: %s",
+                getattr(resp, "code", None),
+                getattr(resp, "msg", ""),
+            )
+        else:
+            logger.info("Removed processing reaction from %s", message_id)
+    except Exception as e:
+        logger.warning("Failed to remove reaction for %s: %s", message_id, e)
 
 
 def _noop(_) -> None:
@@ -101,24 +162,19 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         # Use first arXiv id only (one summary per message)
         arxiv_id = ids[0]
         logger.info("arXiv id %s from message %s", arxiv_id, message_id)
+        reaction_id = _add_processing_reaction(message_id)
         try:
             summary = run_summarize(arxiv_id, data_dir=ROOT / "reader" / "data")
             title = f"arXiv {arxiv_id} 摘要"
             paper_dir = ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
-            doc_id = (
-                create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
-                if _feishu_client
-                else None
-            )
-            if doc_id:
-                tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
-                reply_text = f"已创建云文档「{title}」，内容：\n\n{summary}\n\n👉 打开文档：{doc_url(doc_id, tenant_key)}"
-            else:
-                reply_text = f"[arXiv {arxiv_id}]\n{summary}"
-            _reply_to_message(message_id, reply_text)
+            if _feishu_client:
+                _ = create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
+            _reply_to_message(message_id, f"哥我文档写好了 {doc_url(doc_id, tenant_key)}")
         except Exception as e:
             logger.exception("Summarize/reply failed: %s", e)
             _reply_to_message(message_id, f"[arXiv {arxiv_id}] 处理失败: {e!s}")
+        finally:
+            _remove_processing_reaction(message_id, reaction_id)
     except Exception as e:
         logger.exception("Handler error: %s", e)
 

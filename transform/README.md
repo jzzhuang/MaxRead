@@ -7,7 +7,7 @@ Markdown → Feishu docx transformation: parse `.md` into block types (headings,
 - **`constants.py`** – Feishu docx block type IDs (text, heading1–3, equation, bullet, ordered, table, code)
 - **`inline.py`** – `parse_inline(text)` → segments with bold/italic for styled text runs
 - **`parser.py`** – `parse_md_to_blocks(md)` → list of `(block_type, content)` (tables: separator row skipped; content is string or `{"rows": [[cell,...], ...]}` for tables)
-- **`feishu_doc.py`** – `build_block()`, `create_summary_doc()`, `doc_url()` (Feishu API; tables created as native table blocks and cells filled via batch update)
+- **`feishu_doc.py`** – `create_summary_doc()`, `doc_url()` (Feishu API; markdown is converted through Feishu's block-convert API before insertion)
 
 ## Module testing (CLI)
 
