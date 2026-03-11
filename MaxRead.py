@@ -13,6 +13,7 @@ Requires: FEISHU_APP_ID, FEISHU_APP_SECRET in feishu/.env;
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 # Project root
@@ -46,10 +47,12 @@ _feishu_client = None
 _MAX_PROCESSED_IDS = 5000
 _processed_message_ids: set[str] = set()
 _PROCESSING_EMOJI = "OK"
+_PROGRESS_REPLY_MIN_INTERVAL_SECONDS = 6.0
+_MAX_PROGRESS_REPLIES = 12
 
 
-def _reply_to_message(message_id: str, text: str) -> None:
-    """Send a text reply to the given message."""
+def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = True) -> None:
+    """Send a text reply to the given message, defaulting to thread replies."""
     if not _feishu_client:
         logger.error("Feishu HTTP client not initialized")
         return
@@ -57,6 +60,7 @@ def _reply_to_message(message_id: str, text: str) -> None:
         ReplyMessageRequestBody.builder()
         .content(json.dumps({"text": text}))
         .msg_type("text")
+        .reply_in_thread(reply_in_thread)
         .build()
     )
     req = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
@@ -130,6 +134,40 @@ def _noop(_) -> None:
     pass
 
 
+class _ProgressReporter:
+    """Throttle intermediate replies so the chat gets progress without becoming noisy."""
+
+    def __init__(self, message_id: str, arxiv_id: str) -> None:
+        self.message_id = message_id
+        self.arxiv_id = arxiv_id
+        self._last_text = ""
+        self._last_sent_at = 0.0
+        self._sent_count = 0
+
+    def __call__(self, text: str) -> None:
+        text = text.strip()
+        if not text or text == self._last_text:
+            return
+
+        is_stage_update = text.startswith(("开始", "源码", "论文文件", "正在", "摘要"))
+        now = time.monotonic()
+        if self._sent_count >= _MAX_PROGRESS_REPLIES and not is_stage_update:
+            logger.info("Skipping extra progress update for %s: %s", self.arxiv_id, text)
+            return
+        if (
+            self._sent_count > 0
+            and not is_stage_update
+            and now - self._last_sent_at < _PROGRESS_REPLY_MIN_INTERVAL_SECONDS
+        ):
+            logger.debug("Throttled progress update for %s: %s", self.arxiv_id, text)
+            return
+
+        self._last_text = text
+        self._last_sent_at = now
+        self._sent_count += 1
+        _reply_to_message(self.message_id, f"[arXiv {self.arxiv_id}] {text}")
+
+
 def _on_message(data: P2ImMessageReceiveV1) -> None:
     """On Feishu message: if it contains an arXiv link, summarize and reply."""
     try:
@@ -149,6 +187,9 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         if not text:
             return
 
+        tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
+        assert tenant_key, "tenant_key should not be empty"
+
         ids = extract_arxiv_ids(text)
         if not ids:
             return
@@ -163,13 +204,24 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         arxiv_id = ids[0]
         logger.info("arXiv id %s from message %s", arxiv_id, message_id)
         reaction_id = _add_processing_reaction(message_id)
+        progress = _ProgressReporter(message_id, arxiv_id)
         try:
-            summary = run_summarize(arxiv_id, data_dir=ROOT / "reader" / "data")
+            progress("开始处理，后续会同步关键中间进度。")
+            summary = run_summarize(
+                arxiv_id,
+                data_dir=ROOT / "reader" / "data",
+                progress_callback=progress,
+            )
             title = f"arXiv {arxiv_id} 摘要"
             paper_dir = ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
+            doc_id = None
             if _feishu_client:
-                _ = create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
-            _reply_to_message(message_id, f"哥我文档写好了 {doc_url(doc_id, tenant_key)}")
+                progress("摘要已完成，正在生成飞书文档...")
+                doc_id = create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
+            if doc_id:
+                _reply_to_message(message_id, f"哥，文档写好了 {doc_url(doc_id, tenant_key)}")
+            else:
+                _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
         except Exception as e:
             logger.exception("Summarize/reply failed: %s", e)
             _reply_to_message(message_id, f"[arXiv {arxiv_id}] 处理失败: {e!s}")

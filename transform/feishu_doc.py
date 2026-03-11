@@ -37,6 +37,12 @@ from lark_oapi.api.drive.v1.model.upload_all_media_request import UploadAllMedia
 from lark_oapi.api.drive.v1.model.upload_all_media_request_body import (
     UploadAllMediaRequestBody,
 )
+from lark_oapi.api.drive.v1.model.patch_permission_public_request import (
+    PatchPermissionPublicRequest,
+)
+from lark_oapi.api.drive.v1.model.permission_public_request import (
+    PermissionPublicRequest,
+)
 
 from .constants import (
     DOCX_BLOCK_TYPE_IMAGE,
@@ -187,6 +193,28 @@ def _split_markdown_segments(
 
     flush_markdown()
     return segments
+
+
+def _extract_leading_h1_title(md_content: str) -> tuple[str | None, str]:
+    lines = md_content.splitlines()
+    first_non_empty_index: int | None = None
+    for idx, line in enumerate(lines):
+        if line.strip():
+            first_non_empty_index = idx
+            break
+    if first_non_empty_index is None:
+        return None, md_content
+
+    first_line = lines[first_non_empty_index]
+    match = re.fullmatch(r"\s*#(?!#)\s+(.+?)\s*", first_line)
+    if not match:
+        return None, md_content
+
+    extracted_title = match.group(1).strip()
+    remaining_lines = lines[:first_non_empty_index] + lines[first_non_empty_index + 1 :]
+    while remaining_lines and not remaining_lines[0].strip():
+        remaining_lines.pop(0)
+    return extracted_title or None, "\n".join(remaining_lines)
 
 
 def _insert_markdown_chunk(
@@ -343,10 +371,12 @@ def create_summary_doc(
     Returns document_id or None.
     """
     try:
+        extracted_title, normalized_md_content = _extract_leading_h1_title(md_content)
+        doc_title = extracted_title or title
         body = (
             CreateDocumentRequestBody.builder()
             .folder_token("")
-            .title(title)
+            .title(doc_title)
             .build()
         )
         req = CreateDocumentRequest.builder().request_body(body).build()
@@ -360,10 +390,31 @@ def create_summary_doc(
         document_id = getattr(doc, "document_id")
         if not document_id:
             return None
+        permission_req = (
+            PatchPermissionPublicRequest.builder()
+            .type("docx")
+            .token(document_id)
+            .request_body(
+                PermissionPublicRequest.builder()
+                .external_access(True)
+                .share_entity("anyone")
+                .security_entity("anyone_can_edit")
+                .link_share_entity("anyone_editable")
+                .build()
+            )
+            .build()
+        )
+        permission_resp = client.drive.v1.permission_public.patch(permission_req)
+        if getattr(permission_resp, "code", 0) != 0:
+            logger.warning(
+                "Set doc public-edit permission failed: %s %s",
+                getattr(permission_resp, "code"),
+                getattr(permission_resp, "msg"),
+            )
         resolved_base_dir = Path(base_dir).resolve() if base_dir is not None else None
-        segments = _split_markdown_segments(md_content)
+        segments = _split_markdown_segments(normalized_md_content)
         if not segments:
-            segments = [("markdown", md_content.strip() or "（无内容）")]
+            segments = [("markdown", normalized_md_content.strip() or "（无内容）")]
 
         insert_index = 0
         for segment_type, content in segments:

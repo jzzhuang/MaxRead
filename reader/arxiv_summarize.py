@@ -10,6 +10,7 @@ Modes:
   cursor (default): requires the Cursor `agent` command to be installed and authenticated.
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -18,6 +19,7 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 # ArXiv requires a descriptive User-Agent
 USER_AGENT = "MaxRead-arxiv-summarize/1.0 (mailto:research@example.com)"
@@ -34,6 +36,66 @@ def _load_prompt() -> str:
 
 
 SUMMARY_PROMPT = _load_prompt()
+
+
+def _emit_progress(progress_callback: Callable[[str], None] | None, message: str) -> None:
+    """Send a progress update if a callback was provided."""
+    if progress_callback and message:
+        progress_callback(message)
+
+
+def _extract_stream_text(payload: dict) -> str:
+    """Extract user-visible text from agent stream-json output."""
+    event_type = str(payload.get("type") or "")
+    if event_type == "assistant":
+        message = payload.get("message") or {}
+        contents = message.get("content") or []
+        parts: list[str] = []
+        for item in contents:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts)
+
+    if event_type == "tool_call":
+        subtype = str(payload.get("subtype") or "")
+        tool_call = payload.get("tool_call") or {}
+        if "readToolCall" in tool_call:
+            args = (tool_call.get("readToolCall") or {}).get("args") or {}
+            path = Path(args.get("path") or "").name
+            if subtype == "started" and path:
+                return f"正在读取 {path}"
+            if subtype == "completed" and path:
+                return f"已读取 {path}"
+        if "shellToolCall" in tool_call and subtype == "started":
+            return "正在运行命令"
+        if "editToolCall" in tool_call and subtype == "started":
+            return "正在修改文件"
+        return ""
+
+    if event_type == "result" and payload.get("subtype") == "success":
+        result = payload.get("result")
+        if isinstance(result, str):
+            return result.strip()
+
+    return ""
+
+
+def _should_forward_agent_output(text: str) -> bool:
+    """Hide noisy or reasoning-related text from user-visible progress updates."""
+    lowered = " ".join(text.lower().split())
+    if not lowered:
+        return False
+    hidden_markers = (
+        "thinking",
+        "reasoning",
+        "thought process",
+        "chain of thought",
+        "tokens used",
+        "context window",
+    )
+    return not any(marker in lowered for marker in hidden_markers)
 
 
 def _resolve_cursor_api_key() -> str | None:
@@ -139,7 +201,11 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     return out_file.read_text(encoding="utf-8").strip()
 
 
-def launch_agent_in_folder(paper_dir: Path, prompt: str) -> str:
+def launch_agent_in_folder(
+    paper_dir: Path,
+    prompt: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str:
     """
     Launch the Cursor agent in paper_dir with the given prompt. The agent can
     read files in that folder and write summarize.md. Returns the content of
@@ -156,21 +222,63 @@ def launch_agent_in_folder(paper_dir: Path, prompt: str) -> str:
         )
     env = os.environ.copy()
     env["CURSOR_API_KEY"] = api_key
-    proc = subprocess.run(
-        ["agent", "-p", prompt, "--workspace", str(paper_dir), "--yolo"],
+    _emit_progress(progress_callback, "正在启动 Cursor 总结代理...")
+    command = [
+        "agent",
+        "--print",
+        "--output-format",
+        "stream-json",
+        prompt,
+        "--workspace",
+        str(paper_dir),
+        "--model",
+        "claude-4.6-opus-high-thinking",
+        "--yolo",
+        "--trust",
+    ]
+    output_chunks: list[str] = []
+    with subprocess.Popen(
+        command,
         cwd=str(paper_dir),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=600,
         env=env,
-    )
+        bufsize=1,
+    ) as proc:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                output_chunks.append(line)
+                raw_line = line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    payload = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    if _should_forward_agent_output(raw_line):
+                        _emit_progress(progress_callback, f"Cursor: {raw_line}")
+                    continue
+
+                visible_text = _extract_stream_text(payload)
+                if _should_forward_agent_output(visible_text):
+                    _emit_progress(progress_callback, f"Cursor: {visible_text}")
+            proc.wait(timeout=1800)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise subprocess.TimeoutExpired(command, 1800, output="".join(output_chunks))
+
+    stdout = "".join(output_chunks)
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        err = stdout.strip() or f"exit code {proc.returncode}"
         raise RuntimeError(f"agent command failed: {err}")
     if not out_file.exists():
-        cmd = f'agent -p {prompt!r} --workspace {paper_dir!r}'
+        cmd = (
+            f"agent --print --output-format stream-json {prompt!r} --workspace {paper_dir!r} "
+            "--model claude-4.6-opus-high-thinking --yolo --trust"
+        )
         raise FileNotFoundError(
-            f"Agent did not create summarize.md in {paper_dir}. stdout: {(proc.stdout or '')[:500]}\n\n"
+            f"Agent did not create summarize.md in {paper_dir}. stdout: {stdout[:500]}\n\n"
             f"Run this in your terminal to run the agent directly:\n  {cmd}"
         )
     return out_file.read_text(encoding="utf-8").strip()
@@ -180,6 +288,7 @@ def run_summarize(
     arxiv_id: str,
     data_dir: Path | None = None,
     mode: str = "cursor",
+    progress_callback: Callable[[str], None] | None = None,
 ) -> str:
     """
     Download arXiv source, extract to data_dir/<id>/, launch the chosen agent
@@ -189,13 +298,16 @@ def run_summarize(
     data_dir = data_dir or DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
     paper_dir = data_dir / arxiv_id.replace("/", "_")
+    _emit_progress(progress_callback, f"开始下载 arXiv {arxiv_id} 源码...")
     archive_path = download_source(arxiv_id)
     try:
+        _emit_progress(progress_callback, "源码下载完成，正在解压文件...")
         extract_archive(archive_path, paper_dir)
     finally:
         archive_path.unlink(missing_ok=True)
+    _emit_progress(progress_callback, f"论文文件已准备完成：{paper_dir.name}")
     if mode == "cursor":
-        return launch_agent_in_folder(paper_dir, SUMMARY_PROMPT)
+        return launch_agent_in_folder(paper_dir, SUMMARY_PROMPT, progress_callback=progress_callback)
     return launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
 
 

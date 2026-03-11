@@ -1,3 +1,4 @@
 */__pycache__/
 transform_out/
 *.pyc
+cursor_api_key.txt
