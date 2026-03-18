@@ -183,7 +183,7 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     out_file = paper_dir / "summarize.md"
     out_file.unlink(missing_ok=True)
     proc = subprocess.run(
-        ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"],
+        ["claude", "-p", prompt, "--model", "claude-opus-4-6-thinking-medium", "--permission-mode", "bypassPermissions"],
         cwd=str(paper_dir),
         capture_output=True,
         text=True,
@@ -287,7 +287,7 @@ def launch_agent_in_folder(
 def run_summarize(
     arxiv_id: str,
     data_dir: Path | None = None,
-    mode: str = "cursor",
+    mode: str = "claude",
     progress_callback: Callable[[str], None] | None = None,
 ) -> str:
     """
@@ -319,8 +319,8 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         choices=("claude", "cursor"),
-        default="cursor",
-        help="Agent to use: cursor (default) or claude",
+        default="claude",
+        help="Agent to use: claude (default) or cursor",
     )
     args = parser.parse_args()
 

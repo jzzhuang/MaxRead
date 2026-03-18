@@ -15,6 +15,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Project root
 ROOT = Path(__file__).resolve().parent
@@ -49,6 +50,7 @@ _processed_message_ids: set[str] = set()
 _PROCESSING_EMOJI = "OK"
 _PROGRESS_REPLY_MIN_INTERVAL_SECONDS = 6.0
 _MAX_PROGRESS_REPLIES = 12
+_DOC_LINK_METADATA_FILE = "doc_link.json"
 
 
 def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = True) -> None:
@@ -134,6 +136,49 @@ def _noop(_) -> None:
     pass
 
 
+def _paper_dir_for_arxiv(arxiv_id: str) -> Path:
+    """Return the local working directory for a paper."""
+    return ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
+
+
+def _doc_link_metadata_path(arxiv_id: str) -> Path:
+    """Return the metadata path used to persist a generated doc link."""
+    return _paper_dir_for_arxiv(arxiv_id) / _DOC_LINK_METADATA_FILE
+
+
+def _load_saved_doc_link(arxiv_id: str) -> str | None:
+    """Load a previously saved Feishu doc link for the given arXiv id."""
+    metadata_path = _doc_link_metadata_path(arxiv_id)
+    if not metadata_path.is_file():
+        return None
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to read saved doc link for %s: %s", arxiv_id, e)
+        return None
+
+    link = str(payload.get("doc_url") or "").strip()
+    return link or None
+
+
+def _save_doc_link(arxiv_id: str, document_id: str, document_url: str, tenant_key: str | None) -> None:
+    """Persist the Feishu doc metadata so duplicate requests can reuse it."""
+    paper_dir = _paper_dir_for_arxiv(arxiv_id)
+    paper_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = _doc_link_metadata_path(arxiv_id)
+    payload = {
+        "arxiv_id": arxiv_id,
+        "document_id": document_id,
+        "doc_url": document_url,
+        "tenant_key": tenant_key,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    metadata_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 class _ProgressReporter:
     """Throttle intermediate replies so the chat gets progress without becoming noisy."""
 
@@ -206,6 +251,12 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         reaction_id = _add_processing_reaction(message_id)
         progress = _ProgressReporter(message_id, arxiv_id)
         try:
+            existing_doc_link = _load_saved_doc_link(arxiv_id)
+            if existing_doc_link:
+                logger.info("Reusing saved Feishu doc link for arXiv %s", arxiv_id)
+                _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+                return
+
             progress("开始处理，后续会同步关键中间进度。")
             summary = run_summarize(
                 arxiv_id,
@@ -213,13 +264,15 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
                 progress_callback=progress,
             )
             title = f"arXiv {arxiv_id} 摘要"
-            paper_dir = ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
+            paper_dir = _paper_dir_for_arxiv(arxiv_id)
             doc_id = None
             if _feishu_client:
                 progress("摘要已完成，正在生成飞书文档...")
                 doc_id = create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
             if doc_id:
-                _reply_to_message(message_id, f"哥，文档写好了 {doc_url(doc_id, tenant_key)}")
+                document_link = doc_url(doc_id, tenant_key)
+                _save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
+                _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
             else:
                 _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
         except Exception as e:
