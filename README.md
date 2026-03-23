@@ -60,6 +60,8 @@ Use Feishu Open Platform long connection to receive events and print messages in
 cp feishu/.env.example feishu/.env
 # 编辑 .env 填写 FEISHU_APP_ID、FEISHU_APP_SECRET；
 # 若控制台配置了验证/加密则填 FEISHU_VERIFICATION_TOKEN、FEISHU_ENCRYPT_KEY
+# 建议设置 CLAUDE_CLI_PATH（例如 /home/<user>/.local/bin/claude），
+# 这样在新终端/新会话里也能稳定找到 Claude CLI
 ```
 
 在项目根目录运行：
@@ -74,5 +76,3 @@ python -m feishu.bot_ws
 
 - 发消息：`python -m feishu.send_message "你好"`
 - 代码中调用 API：`from feishu.bot import get_client`，用 `get_client()` 获取 Lark 客户端。
-
-[在做了][了解][敲键盘][完成]

@@ -5,7 +5,6 @@ Supports inline bold/italic, bullet/ordered lists, and native tables.
 import logging
 import re
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Union
@@ -73,40 +72,46 @@ def _resolve_image_path(image_path: str, base_dir: Path | None) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _image_display_size(image_path: Path) -> tuple[int, int] | None:
+    """Return (width, height) in pixels.
+
+    Scale to width=800; if the resulting height < 600 the image is landscape
+    (width-dominated) so keep width=800.  Otherwise use width=400.
+    """
+    try:
+        import fitz
+
+        doc = fitz.open(str(image_path))
+        page = doc[0]
+        rect = page.rect
+        doc.close()
+        w, h = int(rect.width), int(rect.height)
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    h_at_800 = int(h * 800 / w)
+    target_w = 800 if h_at_800 < 600 else 400
+    return target_w, max(1, int(h * target_w / w))
+
+
 def _prepare_upload_image(image_path: Path) -> tuple[Path, str | None]:
     if image_path.suffix.lower() != ".pdf":
         return image_path, None
 
-    if shutil.which("pdftoppm") is None:
-        raise RuntimeError("pdftoppm not found; cannot convert PDF figures to PNG")
+    import fitz  # PyMuPDF
 
     temp_dir = tempfile.mkdtemp(prefix="maxread-feishu-img-")
-    out_prefix = Path(temp_dir) / image_path.stem
-    proc = subprocess.run(
-        [
-            "pdftoppm",
-            "-f",
-            "1",
-            "-l",
-            "1",
-            "-singlefile",
-            "-png",
-            str(image_path),
-            str(out_prefix),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
+    try:
+        doc = fitz.open(str(image_path))
+        page = doc[0]
+        pix = page.get_pixmap()
+        png_path = Path(temp_dir) / (image_path.stem + ".png")
+        pix.save(str(png_path))
+        doc.close()
+    except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(f"PDF to PNG conversion failed: {err}")
-
-    png_path = out_prefix.with_suffix(".png")
-    if not png_path.is_file():
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise RuntimeError("PDF to PNG conversion did not produce an output file")
+        raise RuntimeError(f"PDF to PNG conversion failed: {e}") from e
     return png_path, temp_dir
 
 
@@ -333,8 +338,12 @@ def _insert_image_block(
             logger.warning("Upload image returned no file token for %s", upload_path)
             return False
 
+        display_size = _image_display_size(upload_path)
+        replace_image_dict: dict = {"token": file_token}
+        if display_size:
+            replace_image_dict["width"], replace_image_dict["height"] = display_size
         patch_body = UpdateBlockRequest()
-        patch_body.replace_image = ReplaceImageRequest({"token": file_token})
+        patch_body.replace_image = ReplaceImageRequest(replace_image_dict)
         patch_req = (
             PatchDocumentBlockRequest.builder()
             .document_id(document_id)
@@ -364,6 +373,7 @@ def create_summary_doc(
     md_content: str,
     *,
     base_dir: str | Path | None = None,
+    arxiv_id: str | None = None,
 ) -> str | None:
     """
     Create a cloud doc (云文档) from Markdown summary with sections, text, equations,
@@ -373,6 +383,8 @@ def create_summary_doc(
     try:
         extracted_title, normalized_md_content = _extract_leading_h1_title(md_content)
         doc_title = extracted_title or title
+        if arxiv_id:
+            doc_title = f"[{arxiv_id}] {doc_title}"
         body = (
             CreateDocumentRequestBody.builder()
             .folder_token("")

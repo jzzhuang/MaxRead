@@ -6,13 +6,14 @@ concise summary to summarize.md (Markdown with sections, paragraphs, and LaTeX
 equations), then print the result.
 
 Modes:
-  claude: requires the `claude` command (Claude Code) to be installed.
-  cursor (default): requires the Cursor `agent` command to be installed and authenticated.
+  claude (default): requires Claude Code CLI to be installed.
+  cursor: requires the Cursor `agent` command to be installed and authenticated.
 """
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -26,6 +27,21 @@ USER_AGENT = "MaxRead-arxiv-summarize/1.0 (mailto:research@example.com)"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 PROMPT_FILE = Path(__file__).resolve().parent / "prompt.txt"
 CURSOR_KEY_FILE = Path(__file__).resolve().parent.parent / "cursor_api_key.txt"
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+
+def _load_claude_settings_env() -> dict:
+    """Load env-like values from ~/.claude/settings.json when available."""
+    if not CLAUDE_SETTINGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        env_payload = data.get("env") or {}
+        if isinstance(env_payload, dict):
+            return env_payload
+    except Exception:
+        pass
+    return {}
 
 
 def _load_prompt() -> str:
@@ -114,6 +130,48 @@ def _resolve_cursor_api_key() -> str | None:
     return None
 
 
+def _resolve_claude_cli_path() -> str:
+    """
+    Resolve Claude CLI executable path in a persistent-friendly order:
+    1) CLAUDE_CLI_PATH in environment (including feishu/.env via dotenv)
+    2) CLAUDE_CLI_PATH in ~/.claude/settings.json env block
+    3) PATH lookup
+    4) common user/global install locations
+    """
+    env_path = (os.environ.get("CLAUDE_CLI_PATH") or "").strip()
+    if env_path:
+        expanded = str(Path(env_path).expanduser())
+        if Path(expanded).is_file():
+            return expanded
+        raise FileNotFoundError(f"CLAUDE_CLI_PATH is set but not found: {expanded}")
+
+    settings_env = _load_claude_settings_env()
+    settings_path = str(settings_env.get("CLAUDE_CLI_PATH") or "").strip()
+    if settings_path:
+        expanded = str(Path(settings_path).expanduser())
+        if Path(expanded).is_file():
+            return expanded
+        raise FileNotFoundError(f"~/.claude/settings.json CLAUDE_CLI_PATH not found: {expanded}")
+
+    from_path = shutil.which("claude")
+    if from_path:
+        return from_path
+
+    candidates = [
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/usr/local/bin/claude"),
+        Path("/usr/bin/claude"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    raise FileNotFoundError(
+        "Claude CLI executable not found. Set CLAUDE_CLI_PATH to the full path of your "
+        "Claude binary (for example, /home/<you>/.local/bin/claude)."
+    )
+
+
 # Bare arXiv id: YYMM.NNNNN or YYMM.NNNNNvN
 _ARXIV_BARE_RE = re.compile(r"(?:^|[^\w.])(\d{4}\.\d{4,5}(?:v\d+)?)(?=[^\d]|$)")
 _ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf|e-print)/([^/?#\s]+)", re.I)
@@ -182,8 +240,17 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     paper_dir = Path(paper_dir).resolve()
     out_file = paper_dir / "summarize.md"
     out_file.unlink(missing_ok=True)
+    claude_cmd = _resolve_claude_cli_path()
     proc = subprocess.run(
-        ["claude", "-p", prompt, "--model", "claude-opus-4-6-thinking-medium", "--permission-mode", "bypassPermissions"],
+        [
+            claude_cmd,
+            "-p",
+            prompt,
+            "--model",
+            "claude-opus-4-6-thinking-medium",
+            "--permission-mode",
+            "bypassPermissions",
+        ],
         cwd=str(paper_dir),
         capture_output=True,
         text=True,
@@ -191,9 +258,9 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
     )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
-        raise RuntimeError(f"claude command failed: {err}")
+        raise RuntimeError(f"claude command failed ({claude_cmd}): {err}")
     if not out_file.exists():
-        cmd = f'cd {paper_dir!r} && claude -p {prompt!r} --permission-mode bypassPermissions'
+        cmd = f"cd {paper_dir!r} && {claude_cmd!r} -p {prompt!r} --permission-mode bypassPermissions"
         raise FileNotFoundError(
             f"Claude did not create summarize.md in {paper_dir}. stdout: {(proc.stdout or '')[:500]}\n\n"
             f"Run this in your terminal to run Claude directly:\n  {cmd}"

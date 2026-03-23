@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Listen to Feishu; for any message containing an arXiv link (URL or bare id),
-download the TeX source, summarize with Cursor Agent by default
+download the TeX source, summarize with Claude by default
 (output: concise Markdown in summarize.md),
 create a cloud doc (云文档) with sections, paragraphs, and equations, then reply with a short completion message.
+Each incoming message is handled in a background thread so new messages are accepted while work runs;
+a message with multiple arXiv ids processes them with at most two jobs at a time (others queue) and sends one reply per paper.
 
   python MaxRead.py
 
@@ -13,7 +15,8 @@ Requires: FEISHU_APP_ID, FEISHU_APP_SECRET in feishu/.env;
 import json
 import logging
 import sys
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -47,10 +50,17 @@ _feishu_client = None
 # Deduplicate by message_id (Feishu may deliver the same message event more than once)
 _MAX_PROCESSED_IDS = 5000
 _processed_message_ids: set[str] = set()
-_PROCESSING_EMOJI = "OK"
-_PROGRESS_REPLY_MIN_INTERVAL_SECONDS = 6.0
-_MAX_PROGRESS_REPLIES = 12
+_dedup_lock = threading.Lock()
 _DOC_LINK_METADATA_FILE = "doc_link.json"
+
+# Feishu HTTP client may not be thread-safe; serialize API calls.
+_feishu_api_lock = threading.Lock()
+
+# Background work so the WS handler returns immediately and new messages can be accepted.
+# At most 2 arXiv jobs run at once; additional work waits in the executor queue (same for message dispatch).
+_MAX_PARALLEL = 2
+_message_executor = ThreadPoolExecutor(max_workers=_MAX_PARALLEL, thread_name_prefix="feishu_msg")
+_arxiv_executor = ThreadPoolExecutor(max_workers=_MAX_PARALLEL, thread_name_prefix="arxiv")
 
 
 def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = True) -> None:
@@ -67,7 +77,8 @@ def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = Tru
     )
     req = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
     try:
-        resp = _feishu_client.im.v1.message.reply(req)
+        with _feishu_api_lock:
+            resp = _feishu_client.im.v1.message.reply(req)
         if resp and getattr(resp, "code", 0) != 0:
             logger.warning("Reply API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
         else:
@@ -76,14 +87,14 @@ def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = Tru
         logger.exception("Failed to reply: %s", e)
 
 
-def _add_processing_reaction(message_id: str) -> str | None:
-    """Add a temporary reaction to indicate processing started."""
+def _add_reaction(message_id: str, emoji_type: str) -> str | None:
+    """Add a reaction of the given emoji type; returns the reaction_id."""
     if not _feishu_client:
         return None
     try:
         body = (
             CreateMessageReactionRequestBody.builder()
-            .reaction_type(Emoji.builder().emoji_type(_PROCESSING_EMOJI).build())
+            .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
             .build()
         )
         req = (
@@ -92,10 +103,11 @@ def _add_processing_reaction(message_id: str) -> str | None:
             .request_body(body)
             .build()
         )
-        resp = _feishu_client.im.v1.message_reaction.create(req)
+        with _feishu_api_lock:
+            resp = _feishu_client.im.v1.message_reaction.create(req)
         if resp and getattr(resp, "code", 0) == 0:
             reaction_id = getattr(getattr(resp, "data", None), "reaction_id", None)
-            logger.info("Added processing reaction to %s", message_id)
+            logger.info("Added reaction %s to %s", emoji_type, message_id)
             return reaction_id
         logger.warning(
             "Add reaction API code: %s msg: %s",
@@ -107,8 +119,8 @@ def _add_processing_reaction(message_id: str) -> str | None:
     return None
 
 
-def _remove_processing_reaction(message_id: str, reaction_id: str | None) -> None:
-    """Remove the temporary processing reaction."""
+def _remove_reaction(message_id: str, reaction_id: str | None) -> None:
+    """Remove a reaction by its reaction_id."""
     if not _feishu_client or not reaction_id:
         return
     try:
@@ -118,7 +130,8 @@ def _remove_processing_reaction(message_id: str, reaction_id: str | None) -> Non
             .reaction_id(reaction_id)
             .build()
         )
-        resp = _feishu_client.im.v1.message_reaction.delete(req)
+        with _feishu_api_lock:
+            resp = _feishu_client.im.v1.message_reaction.delete(req)
         if resp and getattr(resp, "code", 0) != 0:
             logger.warning(
                 "Delete reaction API code: %s msg: %s",
@@ -126,7 +139,7 @@ def _remove_processing_reaction(message_id: str, reaction_id: str | None) -> Non
                 getattr(resp, "msg", ""),
             )
         else:
-            logger.info("Removed processing reaction from %s", message_id)
+            logger.info("Removed reaction from %s", message_id)
     except Exception as e:
         logger.warning("Failed to remove reaction for %s: %s", message_id, e)
 
@@ -179,42 +192,114 @@ def _save_doc_link(arxiv_id: str, document_id: str, document_url: str, tenant_ke
     )
 
 
-class _ProgressReporter:
-    """Throttle intermediate replies so the chat gets progress without becoming noisy."""
+def _process_one_arxiv_for_message(
+    message_id: str,
+    tenant_key: str,
+    arxiv_id: str,
+    *,
+    staged_reactions: bool,
+) -> None:
+    """Download/summarize one paper and reply. staged_reactions drives Get/OnIt/Typing on this message."""
+    logger.info("arXiv id %s for message %s", arxiv_id, message_id)
+    reaction_id: str | None = None
 
-    def __init__(self, message_id: str, arxiv_id: str) -> None:
-        self.message_id = message_id
-        self.arxiv_id = arxiv_id
-        self._last_text = ""
-        self._last_sent_at = 0.0
-        self._sent_count = 0
+    if staged_reactions:
+        reaction_id = _add_reaction(message_id, "Get")
 
-    def __call__(self, text: str) -> None:
-        text = text.strip()
-        if not text or text == self._last_text:
+    try:
+        existing_doc_link = _load_saved_doc_link(arxiv_id)
+        if existing_doc_link:
+            logger.info("Reusing saved Feishu doc link for arXiv %s", arxiv_id)
+            _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+            if staged_reactions and reaction_id:
+                _remove_reaction(message_id, reaction_id)
+                reaction_id = None
             return
 
-        is_stage_update = text.startswith(("开始", "源码", "论文文件", "正在", "摘要"))
-        now = time.monotonic()
-        if self._sent_count >= _MAX_PROGRESS_REPLIES and not is_stage_update:
-            logger.info("Skipping extra progress update for %s: %s", self.arxiv_id, text)
-            return
-        if (
-            self._sent_count > 0
-            and not is_stage_update
-            and now - self._last_sent_at < _PROGRESS_REPLY_MIN_INTERVAL_SECONDS
-        ):
-            logger.debug("Throttled progress update for %s: %s", self.arxiv_id, text)
+        def on_progress(msg: str) -> None:
+            nonlocal reaction_id
+            msg = msg.strip()
+            if not msg:
+                return
+            logger.info("[%s] %s", arxiv_id, msg)
+            if not staged_reactions:
+                return
+            if msg.startswith("论文文件已准备完成"):
+                _remove_reaction(message_id, reaction_id)
+                reaction_id = _add_reaction(message_id, "OnIt")
+
+        summary = run_summarize(
+            arxiv_id,
+            data_dir=ROOT / "reader" / "data",
+            mode="claude",
+            progress_callback=on_progress,
+        )
+
+        if staged_reactions:
+            _remove_reaction(message_id, reaction_id)
+            reaction_id = _add_reaction(message_id, "Typing")
+
+        title = f"arXiv {arxiv_id} 摘要"
+        paper_dir = _paper_dir_for_arxiv(arxiv_id)
+        doc_id = None
+        if _feishu_client:
+            with _feishu_api_lock:
+                doc_id = create_summary_doc(
+                    _feishu_client, title, summary, base_dir=paper_dir, arxiv_id=arxiv_id
+                )
+        if doc_id:
+            document_link = doc_url(doc_id, tenant_key)
+            _save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
+            _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
+        else:
+            _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
+    except Exception as e:
+        logger.exception("Summarize/reply failed: %s", e)
+        _reply_to_message(message_id, f"[arXiv {arxiv_id}] 处理失败: {e!s}")
+    finally:
+        if staged_reactions and reaction_id:
+            _remove_reaction(message_id, reaction_id)
+
+
+def _handle_message_work(message_id: str, tenant_key: str, ids: list[str]) -> None:
+    """Run one or more arXiv jobs: single message uses staged reactions; multiple share a global cap of 2."""
+    try:
+        if len(ids) == 1:
+            fut = _arxiv_executor.submit(
+                _process_one_arxiv_for_message,
+                message_id,
+                tenant_key,
+                ids[0],
+                staged_reactions=True,
+            )
+            fut.result()
             return
 
-        self._last_text = text
-        self._last_sent_at = now
-        self._sent_count += 1
-        _reply_to_message(self.message_id, f"[arXiv {self.arxiv_id}] {text}")
+        reaction_id = _add_reaction(message_id, "Get")
+        try:
+            futures = [
+                _arxiv_executor.submit(
+                    _process_one_arxiv_for_message,
+                    message_id,
+                    tenant_key,
+                    aid,
+                    staged_reactions=False,
+                )
+                for aid in ids
+            ]
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.exception("Parallel arXiv task failed: %s", e)
+        finally:
+            _remove_reaction(message_id, reaction_id)
+    except Exception as e:
+        logger.exception("Handler error: %s", e)
 
 
 def _on_message(data: P2ImMessageReceiveV1) -> None:
-    """On Feishu message: if it contains an arXiv link, summarize and reply."""
+    """On Feishu message: if it contains an arXiv link, summarize and reply (work runs in background)."""
     try:
         event = data.event
         message = event.message
@@ -239,47 +324,14 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         if not ids:
             return
 
-        if message_id in _processed_message_ids:
-            return
-        if len(_processed_message_ids) >= _MAX_PROCESSED_IDS:
-            _processed_message_ids.clear()
-        _processed_message_ids.add(message_id)
-
-        # Use first arXiv id only (one summary per message)
-        arxiv_id = ids[0]
-        logger.info("arXiv id %s from message %s", arxiv_id, message_id)
-        reaction_id = _add_processing_reaction(message_id)
-        progress = _ProgressReporter(message_id, arxiv_id)
-        try:
-            existing_doc_link = _load_saved_doc_link(arxiv_id)
-            if existing_doc_link:
-                logger.info("Reusing saved Feishu doc link for arXiv %s", arxiv_id)
-                _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+        with _dedup_lock:
+            if message_id in _processed_message_ids:
                 return
+            if len(_processed_message_ids) >= _MAX_PROCESSED_IDS:
+                _processed_message_ids.clear()
+            _processed_message_ids.add(message_id)
 
-            progress("开始处理，后续会同步关键中间进度。")
-            summary = run_summarize(
-                arxiv_id,
-                data_dir=ROOT / "reader" / "data",
-                progress_callback=progress,
-            )
-            title = f"arXiv {arxiv_id} 摘要"
-            paper_dir = _paper_dir_for_arxiv(arxiv_id)
-            doc_id = None
-            if _feishu_client:
-                progress("摘要已完成，正在生成飞书文档...")
-                doc_id = create_summary_doc(_feishu_client, title, summary, base_dir=paper_dir)
-            if doc_id:
-                document_link = doc_url(doc_id, tenant_key)
-                _save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
-                _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
-            else:
-                _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
-        except Exception as e:
-            logger.exception("Summarize/reply failed: %s", e)
-            _reply_to_message(message_id, f"[arXiv {arxiv_id}] 处理失败: {e!s}")
-        finally:
-            _remove_processing_reaction(message_id, reaction_id)
+        _message_executor.submit(_handle_message_work, message_id, tenant_key, ids)
     except Exception as e:
         logger.exception("Handler error: %s", e)
 
