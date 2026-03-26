@@ -13,12 +13,14 @@ Requires: FEISHU_APP_ID, FEISHU_APP_SECRET in feishu/.env;
   CURSOR_API_KEY in env or cursor_api_key.txt at repo root.
 """
 import json
+import hashlib
 import logging
+import os
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Project root
 ROOT = Path(__file__).resolve().parent
@@ -57,10 +59,261 @@ _DOC_LINK_METADATA_FILE = "doc_link.json"
 _feishu_api_lock = threading.Lock()
 
 # Background work so the WS handler returns immediately and new messages can be accepted.
-# At most 2 arXiv jobs run at once; additional work waits in the executor queue (same for message dispatch).
+# At most 2 arXiv jobs run at once; additional work waits in a disk-backed queue so restart can resume them.
 _MAX_PARALLEL = 2
-_message_executor = ThreadPoolExecutor(max_workers=_MAX_PARALLEL, thread_name_prefix="feishu_msg")
-_arxiv_executor = ThreadPoolExecutor(max_workers=_MAX_PARALLEL, thread_name_prefix="arxiv")
+_RESTART_DELAY_SECONDS = 3
+_restart_lock = threading.Lock()
+_restart_scheduled = False
+_queue_lock = threading.Lock()
+_queue_event = threading.Event()
+_queue_workers_started = False
+_QUEUE_DIR = ROOT / ".maxread_queue"
+_QUEUE_PENDING_DIR = _QUEUE_DIR / "pending"
+_QUEUE_RUNNING_DIR = _QUEUE_DIR / "running"
+_QUEUE_GROUP_DIR = _QUEUE_DIR / "groups"
+
+
+class RestartRequestedError(RuntimeError):
+    """Raised when the current job should be retried after a process restart."""
+    pass
+
+
+def _write_json_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
+
+
+def _read_json_file(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _job_key(message_id: str, arxiv_id: str) -> str:
+    raw = f"{message_id}\0{arxiv_id}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _group_key(message_id: str) -> str:
+    return hashlib.sha1(message_id.encode("utf-8")).hexdigest()
+
+
+def _pending_job_path(job_key: str) -> Path:
+    return _QUEUE_PENDING_DIR / f"{job_key}.json"
+
+
+def _running_job_path(job_key: str) -> Path:
+    return _QUEUE_RUNNING_DIR / f"{job_key}.json"
+
+
+def _group_state_path(message_id: str) -> Path:
+    return _QUEUE_GROUP_DIR / f"{_group_key(message_id)}.json"
+
+
+def _recover_running_jobs() -> int:
+    recovered = 0
+    for running_path in sorted(_QUEUE_RUNNING_DIR.glob("*.json")):
+        payload = _read_json_file(running_path)
+        _requeue_job_at_end(running_path, payload, note="Recovered after restart")
+        recovered += 1
+    return recovered
+
+
+def _claim_next_job() -> tuple[Path, dict] | None:
+    with _queue_lock:
+        if _restart_scheduled:
+            return None
+        pending_paths = sorted(_QUEUE_PENDING_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        for pending_path in pending_paths:
+            running_path = _QUEUE_RUNNING_DIR / pending_path.name
+            try:
+                pending_path.replace(running_path)
+            except FileNotFoundError:
+                continue
+            return running_path, _read_json_file(running_path)
+    return None
+
+
+def _complete_job(running_path: Path) -> None:
+    try:
+        running_path.unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning("Failed to remove completed queue job %s: %s", running_path.name, e)
+
+
+def _requeue_job_at_end(running_path: Path, payload: dict, *, note: str) -> None:
+    pending_path = _QUEUE_PENDING_DIR / running_path.name
+    updated_payload = dict(payload)
+    updated_payload["queued_at"] = datetime.now(timezone.utc).isoformat()
+    updated_payload["retry_count"] = int(updated_payload.get("retry_count") or 0) + 1
+    updated_payload["last_requeue_note"] = note
+    _write_json_file(pending_path, updated_payload)
+    running_path.unlink(missing_ok=True)
+    _queue_event.set()
+
+
+def _ensure_group_state(message_id: str, total_jobs: int, reaction_id: str | None) -> None:
+    path = _group_state_path(message_id)
+    with _queue_lock:
+        if path.exists():
+            return
+        _write_json_file(
+            path,
+            {
+                "message_id": message_id,
+                "remaining": total_jobs,
+                "reaction_id": reaction_id,
+            },
+        )
+
+
+def _mark_group_job_finished(message_id: str) -> None:
+    path = _group_state_path(message_id)
+    reaction_id: str | None = None
+    with _queue_lock:
+        if not path.exists():
+            return
+        payload = _read_json_file(path)
+        remaining = max(0, int(payload.get("remaining") or 0) - 1)
+        if remaining > 0:
+            payload["remaining"] = remaining
+            _write_json_file(path, payload)
+            return
+        reaction_id = str(payload.get("reaction_id") or "").strip() or None
+        path.unlink(missing_ok=True)
+    if reaction_id:
+        _remove_reaction(message_id, reaction_id)
+
+
+def _enqueue_arxiv_job(
+    message_id: str,
+    tenant_key: str,
+    arxiv_id: str,
+    *,
+    staged_reactions: bool,
+    group_message_id: str | None = None,
+) -> None:
+    job_key = _job_key(message_id, arxiv_id)
+    pending_path = _pending_job_path(job_key)
+    running_path = _running_job_path(job_key)
+    payload = {
+        "message_id": message_id,
+        "tenant_key": tenant_key,
+        "arxiv_id": arxiv_id,
+        "staged_reactions": staged_reactions,
+        "group_message_id": group_message_id,
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _queue_lock:
+        if pending_path.exists() or running_path.exists():
+            logger.info("Queue job already exists for message %s arXiv %s", message_id, arxiv_id)
+            return
+        _write_json_file(pending_path, payload)
+    _queue_event.set()
+
+
+def _queue_worker() -> None:
+    while True:
+        claimed = _claim_next_job()
+        if claimed is None:
+            _queue_event.clear()
+            _queue_event.wait(timeout=1.0)
+            continue
+
+        running_path, job = claimed
+        group_message_id = str(job.get("group_message_id") or "").strip() or None
+        preserve_running_job = False
+        try:
+            _process_one_arxiv_for_message(
+                str(job["message_id"]),
+                str(job["tenant_key"]),
+                str(job["arxiv_id"]),
+                staged_reactions=bool(job.get("staged_reactions")),
+            )
+        except RestartRequestedError:
+            logger.warning(
+                "Requeueing job at end before restart: message=%s arXiv=%s",
+                job.get("message_id"),
+                job.get("arxiv_id"),
+            )
+            _requeue_job_at_end(running_path, job, note="Claude CLI crash restart")
+            preserve_running_job = True
+        except Exception as e:
+            logger.exception("Queue worker failed for %s: %s", running_path.name, e)
+            logger.warning(
+                "Requeueing failed job at end: message=%s arXiv=%s",
+                job.get("message_id"),
+                job.get("arxiv_id"),
+            )
+            _requeue_job_at_end(running_path, job, note=f"Job failed: {type(e).__name__}")
+            preserve_running_job = True
+        finally:
+            if not preserve_running_job and running_path.exists():
+                _complete_job(running_path)
+            if group_message_id and not preserve_running_job:
+                _mark_group_job_finished(group_message_id)
+
+
+def _start_queue_workers() -> None:
+    global _queue_workers_started
+    with _queue_lock:
+        if _queue_workers_started:
+            return
+        _queue_workers_started = True
+    for index in range(_MAX_PARALLEL):
+        threading.Thread(
+            target=_queue_worker,
+            name=f"arxiv_queue_{index + 1}",
+            daemon=True,
+        ).start()
+
+
+def _initialize_queue() -> None:
+    for path in (_QUEUE_PENDING_DIR, _QUEUE_RUNNING_DIR, _QUEUE_GROUP_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+    recovered = _recover_running_jobs()
+    pending = len(list(_QUEUE_PENDING_DIR.glob("*.json")))
+    if recovered:
+        logger.warning("Recovered %s running arXiv job(s) back into the queue", recovered)
+    if pending:
+        logger.info("Queue has %s pending arXiv job(s) on startup", pending)
+        _queue_event.set()
+    _start_queue_workers()
+
+
+def _should_restart_for_exception(exc: Exception) -> bool:
+    """Restart only for the known Claude/Bun crash that a fresh process often clears."""
+    text = str(exc).lower()
+    if "claude command failed" not in text:
+        return False
+    return "illegal instruction" in text or "bun has crashed" in text
+
+
+def _restart_process_after_delay(reason: str) -> None:
+    logger.warning("MaxRead will restart in %ss: %s", _RESTART_DELAY_SECONDS, reason)
+    time.sleep(_RESTART_DELAY_SECONDS)
+    logger.warning("Restarting MaxRead now")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+def _schedule_process_restart(reason: str) -> None:
+    global _restart_scheduled
+    with _restart_lock:
+        if _restart_scheduled:
+            logger.info("Restart already scheduled; skipping duplicate request")
+            return
+        _restart_scheduled = True
+    threading.Thread(
+        target=_restart_process_after_delay,
+        args=(reason,),
+        name="maxread_restart",
+        daemon=True,
+    ).start()
 
 
 def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = True) -> None:
@@ -255,48 +508,13 @@ def _process_one_arxiv_for_message(
             _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
     except Exception as e:
         logger.exception("Summarize/reply failed: %s", e)
-        _reply_to_message(message_id, f"[arXiv {arxiv_id}] 处理失败: {e!s}")
+        if _should_restart_for_exception(e):
+            _schedule_process_restart(f"Claude CLI crash while handling arXiv {arxiv_id}")
+            raise RestartRequestedError(f"Restart requested for arXiv {arxiv_id}") from e
+        raise
     finally:
         if staged_reactions and reaction_id:
             _remove_reaction(message_id, reaction_id)
-
-
-def _handle_message_work(message_id: str, tenant_key: str, ids: list[str]) -> None:
-    """Run one or more arXiv jobs: single message uses staged reactions; multiple share a global cap of 2."""
-    try:
-        if len(ids) == 1:
-            fut = _arxiv_executor.submit(
-                _process_one_arxiv_for_message,
-                message_id,
-                tenant_key,
-                ids[0],
-                staged_reactions=True,
-            )
-            fut.result()
-            return
-
-        reaction_id = _add_reaction(message_id, "Get")
-        try:
-            futures = [
-                _arxiv_executor.submit(
-                    _process_one_arxiv_for_message,
-                    message_id,
-                    tenant_key,
-                    aid,
-                    staged_reactions=False,
-                )
-                for aid in ids
-            ]
-            for fut in as_completed(futures):
-                try:
-                    fut.result()
-                except Exception as e:
-                    logger.exception("Parallel arXiv task failed: %s", e)
-        finally:
-            _remove_reaction(message_id, reaction_id)
-    except Exception as e:
-        logger.exception("Handler error: %s", e)
-
 
 def _on_message(data: P2ImMessageReceiveV1) -> None:
     """On Feishu message: if it contains an arXiv link, summarize and reply (work runs in background)."""
@@ -331,7 +549,20 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
                 _processed_message_ids.clear()
             _processed_message_ids.add(message_id)
 
-        _message_executor.submit(_handle_message_work, message_id, tenant_key, ids)
+        if len(ids) == 1:
+            _enqueue_arxiv_job(message_id, tenant_key, ids[0], staged_reactions=True)
+            return
+
+        reaction_id = _add_reaction(message_id, "Get")
+        _ensure_group_state(message_id, len(ids), reaction_id)
+        for arxiv_id in ids:
+            _enqueue_arxiv_job(
+                message_id,
+                tenant_key,
+                arxiv_id,
+                staged_reactions=False,
+                group_message_id=message_id,
+            )
     except Exception as e:
         logger.exception("Handler error: %s", e)
 
@@ -346,6 +577,7 @@ def main() -> None:
         sys.exit(1)
 
     _feishu_client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
+    _initialize_queue()
     encrypt_key = cfg.get("encrypt_key") or ""
     token = cfg.get("verification_token") or ""
     handler = (

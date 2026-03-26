@@ -254,7 +254,7 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
         cwd=str(paper_dir),
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=1200,
     )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
