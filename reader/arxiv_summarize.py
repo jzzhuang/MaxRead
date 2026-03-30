@@ -200,8 +200,16 @@ def extract_arxiv_ids(text: str) -> list[str]:
     return out
 
 
+class ArxivNotFoundError(Exception):
+    """Raised when the arXiv e-print returns a 404."""
+    def __init__(self, arxiv_id: str) -> None:
+        self.arxiv_id = arxiv_id
+        super().__init__(f"arXiv e-print not found: {arxiv_id}")
+
+
 def download_source(arxiv_id: str) -> Path:
     """Download e-print source from arXiv; return path to the downloaded file."""
+    import urllib.error
     import urllib.request
 
     url = f"https://arxiv.org/e-print/{arxiv_id}"
@@ -213,6 +221,11 @@ def download_source(arxiv_id: str) -> Path:
             data = resp.read()
         path.write_bytes(data)
         return path
+    except urllib.error.HTTPError as e:
+        path.unlink(missing_ok=True)
+        if e.code == 404:
+            raise ArxivNotFoundError(arxiv_id) from e
+        raise
     except Exception:
         path.unlink(missing_ok=True)
         raise

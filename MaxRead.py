@@ -36,7 +36,7 @@ from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
 from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
 
 from feishu.config import get_config
-from reader.arxiv_summarize import extract_arxiv_ids, run_summarize
+from reader.arxiv_summarize import ArxivNotFoundError, extract_arxiv_ids, run_summarize
 from transform.feishu_doc import create_summary_doc, doc_url
 
 logging.basicConfig(
@@ -506,6 +506,10 @@ def _process_one_arxiv_for_message(
             _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
         else:
             _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
+    except ArxivNotFoundError:
+        logger.warning("arXiv 404: paper %s not found", arxiv_id)
+        _reply_to_message(message_id, f"哥，我文章下载不了（arXiv {arxiv_id}）")
+        return
     except Exception as e:
         logger.exception("Summarize/reply failed: %s", e)
         if _should_restart_for_exception(e):
