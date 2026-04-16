@@ -174,13 +174,21 @@ def _resolve_claude_cli_path() -> str:
 
 # Bare arXiv id: YYMM.NNNNN or YYMM.NNNNNvN
 _ARXIV_BARE_RE = re.compile(r"(?:^|[^\w.])(\d{4}\.\d{4,5}(?:v\d+)?)(?=[^\d]|$)")
-_ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf|e-print)/([^/?#\s]+)", re.I)
+_ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf|e-print)/([a-zA-Z0-9._/-]+)", re.I)
+
+# Suffixes that are part of the URL path but not part of the arXiv id
+_URL_STRIP_SUFFIXES = re.compile(r"(?:\.pdf|\.html?)$", re.I)
+
+
+def _clean_arxiv_id(raw: str) -> str:
+    """Strip URL artifacts like trailing .pdf from a captured arXiv id."""
+    return _URL_STRIP_SUFFIXES.sub("", raw).strip()
 
 
 def arxiv_id_from_url(url: str) -> str | None:
     """Extract arXiv id from abs/pdf/e-print URL. E.g. 2301.12345 or 2301.12345v2."""
     m = _ARXIV_URL_RE.search(url)
-    return m.group(1).strip() if m else None
+    return _clean_arxiv_id(m.group(1)) if m else None
 
 
 def extract_arxiv_ids(text: str) -> list[str]:
@@ -188,8 +196,8 @@ def extract_arxiv_ids(text: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for m in _ARXIV_URL_RE.finditer(text):
-        aid = m.group(1).strip()
-        if aid not in seen:
+        aid = _clean_arxiv_id(m.group(1))
+        if aid and aid not in seen:
             seen.add(aid)
             out.append(aid)
     for m in _ARXIV_BARE_RE.finditer(text):
@@ -207,28 +215,80 @@ class ArxivNotFoundError(Exception):
         super().__init__(f"arXiv e-print not found: {arxiv_id}")
 
 
-def download_source(arxiv_id: str) -> Path:
-    """Download e-print source from arXiv; return path to the downloaded file."""
-    import urllib.error
-    import urllib.request
+def _verify_archive(path: Path) -> None:
+    """Trial-open the downloaded archive to verify it's not truncated."""
+    data = path.read_bytes()
+    if len(data) == 0:
+        raise IOError("Downloaded file is empty")
+    if data[:2] == b"\x1f\x8b":  # gzip / tar.gz
+        with tarfile.open(path, "r:gz") as tf:
+            tf.getmembers()  # reads the full index; throws on truncation
+    elif data[:2] == b"PK":  # zip
+        with zipfile.ZipFile(path, "r") as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise IOError(f"Corrupt entry in zip: {bad}")
+    # else: unknown format — let extract_archive() deal with it later
 
+
+def download_source(arxiv_id: str, *, _max_retries: int = 3) -> Path:
+    """Download e-print source from arXiv; return path to the downloaded file."""
+    import logging
+    import subprocess
+    import time
+
+    log = logging.getLogger("MaxRead")
     url = f"https://arxiv.org/e-print/{arxiv_id}"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with tempfile.NamedTemporaryFile(delete=False, suffix=".arxiv") as f:
         path = Path(f.name)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = resp.read()
-        path.write_bytes(data)
-        return path
-    except urllib.error.HTTPError as e:
-        path.unlink(missing_ok=True)
-        if e.code == 404:
-            raise ArxivNotFoundError(arxiv_id) from e
-        raise
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+    for attempt in range(_max_retries):
+        try:
+            result = subprocess.run(
+                [
+                    "curl", "-fL",
+                    "--max-time", "700",
+                    "--speed-limit", "10240",
+                    "--speed-time", "240",
+                    "-H", f"User-Agent: {USER_AGENT}",
+                    "-o", str(path),
+                    url,
+                ],
+                capture_output=True,
+                timeout=750,
+            )
+            if result.returncode == 22:  # curl -f returns 22 for HTTP 4xx/5xx
+                stderr = result.stderr.decode(errors="replace")
+                if "404" in stderr:
+                    path.unlink(missing_ok=True)
+                    raise ArxivNotFoundError(arxiv_id)
+                path.unlink(missing_ok=True)
+                raise IOError(f"HTTP error downloading {arxiv_id}: {stderr.strip()}")
+            if result.returncode != 0:
+                raise IOError(
+                    f"curl exited with code {result.returncode}: "
+                    f"{result.stderr.decode(errors='replace').strip()}"
+                )
+            if not path.exists() or path.stat().st_size == 0:
+                raise IOError("Downloaded file is empty")
+
+            _verify_archive(path)
+            return path
+        except ArxivNotFoundError:
+            raise
+        except (IOError, subprocess.TimeoutExpired, tarfile.ReadError) as e:
+            log.warning(
+                "[%s] Download attempt %d/%d failed: %s",
+                arxiv_id, attempt + 1, _max_retries, e,
+            )
+            if attempt < _max_retries - 1:
+                time.sleep(2 ** attempt * 5)  # 5s, 10s
+                continue
+            path.unlink(missing_ok=True)
+            raise
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+    return path  # unreachable, keeps type checkers happy
 
 
 def extract_archive(archive_path: Path, out_dir: Path) -> None:
@@ -267,7 +327,7 @@ def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
         cwd=str(paper_dir),
         capture_output=True,
         text=True,
-        timeout=1200,
+        timeout=None,
     )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
@@ -381,8 +441,18 @@ def run_summarize(
     _emit_progress(progress_callback, f"开始下载 arXiv {arxiv_id} 源码...")
     archive_path = download_source(arxiv_id)
     try:
+        # Clean previous partial extraction to avoid stale files on retry
+        # Preserve queries.json across re-extractions
+        queries_backup = None
+        queries_path = paper_dir / "queries.json"
+        if queries_path.is_file():
+            queries_backup = queries_path.read_bytes()
+        if paper_dir.exists():
+            shutil.rmtree(paper_dir)
         _emit_progress(progress_callback, "源码下载完成，正在解压文件...")
         extract_archive(archive_path, paper_dir)
+        if queries_backup is not None:
+            (paper_dir / "queries.json").write_bytes(queries_backup)
     finally:
         archive_path.unlink(missing_ok=True)
     _emit_progress(progress_callback, f"论文文件已准备完成：{paper_dir.name}")

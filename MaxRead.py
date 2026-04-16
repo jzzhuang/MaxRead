@@ -16,10 +16,11 @@ import json
 import hashlib
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # Project root
@@ -34,6 +35,8 @@ from lark_oapi.api.im.v1.model.delete_message_reaction_request import DeleteMess
 from lark_oapi.api.im.v1.model.emoji import Emoji
 from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
 from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
+
+from lark_oapi.api.contact.v3 import GetUserRequest
 
 from feishu.config import get_config
 from reader.arxiv_summarize import ArxivNotFoundError, extract_arxiv_ids, run_summarize
@@ -195,6 +198,8 @@ def _enqueue_arxiv_job(
     *,
     staged_reactions: bool,
     group_message_id: str | None = None,
+    sender_open_id: str | None = None,
+    sender_name: str | None = None,
 ) -> None:
     job_key = _job_key(message_id, arxiv_id)
     pending_path = _pending_job_path(job_key)
@@ -205,6 +210,8 @@ def _enqueue_arxiv_job(
         "arxiv_id": arxiv_id,
         "staged_reactions": staged_reactions,
         "group_message_id": group_message_id,
+        "sender_open_id": sender_open_id,
+        "sender_name": sender_name,
         "queued_at": datetime.now(timezone.utc).isoformat(),
     }
     with _queue_lock:
@@ -232,6 +239,8 @@ def _queue_worker() -> None:
                 str(job["tenant_key"]),
                 str(job["arxiv_id"]),
                 staged_reactions=bool(job.get("staged_reactions")),
+                sender_open_id=job.get("sender_open_id"),
+                sender_name=job.get("sender_name"),
             )
         except RestartRequestedError:
             logger.warning(
@@ -241,6 +250,20 @@ def _queue_worker() -> None:
             )
             _requeue_job_at_end(running_path, job, note="Claude CLI crash restart")
             preserve_running_job = True
+        except subprocess.TimeoutExpired as e:
+            arxiv_id = str(job.get("arxiv_id", "unknown"))
+            message_id = str(job.get("message_id", ""))
+            logger.error("Claude CLI timed out for arXiv %s, giving up", arxiv_id)
+            # Save the prompt to a .txt so it can be re-run manually
+            errors_dir = ROOT / "errors"
+            errors_dir.mkdir(parents=True, exist_ok=True)
+            prompt_file = errors_dir / f"timed_out_prompt_{arxiv_id.replace('/', '_')}.txt"
+            prompt_content = " ".join(str(a) for a in (e.cmd or [])) if e.cmd else str(e)
+            prompt_file.write_text(prompt_content, encoding="utf-8")
+            logger.info("Saved timed-out prompt to %s", prompt_file)
+            if message_id:
+                _reply_to_message(message_id, f"哥，网又寄了，要不待会再试（arXiv {arxiv_id} 超时了）")
+            # Don't requeue — let it complete and be removed
         except Exception as e:
             logger.exception("Queue worker failed for %s: %s", running_path.name, e)
             logger.warning(
@@ -402,6 +425,28 @@ def _noop(_) -> None:
     pass
 
 
+def _fetch_user_name(open_id: str) -> str | None:
+    """Look up a Feishu user's display name by open_id. Returns None on failure."""
+    if not _feishu_client or not open_id:
+        return None
+    try:
+        req = (
+            GetUserRequest.builder()
+            .user_id(open_id)
+            .user_id_type("open_id")
+            .build()
+        )
+        with _feishu_api_lock:
+            resp = _feishu_client.contact.v3.user.get(req)
+        if resp and getattr(resp, "code", 0) == 0:
+            user = getattr(getattr(resp, "data", None), "user", None)
+            return getattr(user, "name", None) if user else None
+        logger.warning("Fetch user name API code: %s, msg: %s", getattr(resp, "code", None), getattr(resp, "msg", None))
+    except Exception as e:
+        logger.warning("Failed to fetch user name for %s: %s", open_id, e)
+    return None
+
+
 def _paper_dir_for_arxiv(arxiv_id: str) -> Path:
     """Return the local working directory for a paper."""
     return ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
@@ -445,16 +490,69 @@ def _save_doc_link(arxiv_id: str, document_id: str, document_url: str, tenant_ke
     )
 
 
+def _save_query_log(
+    arxiv_id: str,
+    sender_open_id: str | None,
+    sender_name: str | None,
+) -> None:
+    """Append a query record to queries.json in the paper's data directory."""
+    paper_dir = _paper_dir_for_arxiv(arxiv_id)
+    paper_dir.mkdir(parents=True, exist_ok=True)
+    queries_path = paper_dir / "queries.json"
+
+    queries: list[dict] = []
+    if queries_path.is_file():
+        try:
+            queries = json.loads(queries_path.read_text(encoding="utf-8"))
+        except Exception:
+            queries = []
+
+    queries.append({
+        "sender_open_id": sender_open_id,
+        "sender_name": sender_name,
+        "query_time": datetime.now(timezone(timedelta(hours=8))).isoformat(),
+    })
+
+    queries_path.write_text(
+        json.dumps(queries, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _save_reply_time(arxiv_id: str, reply_type: str) -> None:
+    """Update the last query record in queries.json with reply_time."""
+    paper_dir = _paper_dir_for_arxiv(arxiv_id)
+    queries_path = paper_dir / "queries.json"
+    if not queries_path.is_file():
+        return
+    try:
+        queries = json.loads(queries_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not queries:
+        return
+    queries[-1]["reply_time"] = datetime.now(timezone(timedelta(hours=8))).isoformat()
+    queries[-1]["reply_type"] = reply_type
+    queries_path.write_text(
+        json.dumps(queries, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _process_one_arxiv_for_message(
     message_id: str,
     tenant_key: str,
     arxiv_id: str,
     *,
     staged_reactions: bool,
+    sender_open_id: str | None = None,
+    sender_name: str | None = None,
 ) -> None:
     """Download/summarize one paper and reply. staged_reactions drives Get/OnIt/Typing on this message."""
     logger.info("arXiv id %s for message %s", arxiv_id, message_id)
     reaction_id: str | None = None
+
+    _save_query_log(arxiv_id, sender_open_id, sender_name)
 
     if staged_reactions:
         reaction_id = _add_reaction(message_id, "Get")
@@ -464,6 +562,7 @@ def _process_one_arxiv_for_message(
         if existing_doc_link:
             logger.info("Reusing saved Feishu doc link for arXiv %s", arxiv_id)
             _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+            _save_reply_time(arxiv_id, "reused")
             if staged_reactions and reaction_id:
                 _remove_reaction(message_id, reaction_id)
                 reaction_id = None
@@ -504,11 +603,14 @@ def _process_one_arxiv_for_message(
             document_link = doc_url(doc_id, tenant_key)
             _save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
             _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
+            _save_reply_time(arxiv_id, "success")
         else:
             _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
+            _save_reply_time(arxiv_id, "success_no_link")
     except ArxivNotFoundError:
         logger.warning("arXiv 404: paper %s not found", arxiv_id)
         _reply_to_message(message_id, f"哥，我文章下载不了（arXiv {arxiv_id}）")
+        _save_reply_time(arxiv_id, "not_found")
         return
     except Exception as e:
         logger.exception("Summarize/reply failed: %s", e)
@@ -534,6 +636,17 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         try:
             payload = json.loads(content)
             text = (payload.get("text") or "").strip()
+            # Topic groups send messages as rich text (post) with nested content
+            if not text and "content" in payload:
+                parts = []
+                for block in payload["content"]:
+                    for elem in block:
+                        tag = elem.get("tag")
+                        if tag == "text":
+                            parts.append(elem.get("text", ""))
+                        elif tag == "a":
+                            parts.append(elem.get("href", ""))
+                text = " ".join(parts).strip()
         except Exception:
             return
         if not text:
@@ -541,6 +654,12 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
 
         tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
         assert tenant_key, "tenant_key should not be empty"
+
+        # Extract sender info
+        sender = getattr(event, "sender", None)
+        sender_id_obj = getattr(sender, "sender_id", None) if sender else None
+        sender_open_id = getattr(sender_id_obj, "open_id", None) if sender_id_obj else None
+        sender_name = _fetch_user_name(sender_open_id) if sender_open_id else None
 
         ids = extract_arxiv_ids(text)
         if not ids:
@@ -554,7 +673,8 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
             _processed_message_ids.add(message_id)
 
         if len(ids) == 1:
-            _enqueue_arxiv_job(message_id, tenant_key, ids[0], staged_reactions=True)
+            _enqueue_arxiv_job(message_id, tenant_key, ids[0], staged_reactions=True,
+                               sender_open_id=sender_open_id, sender_name=sender_name)
             return
 
         reaction_id = _add_reaction(message_id, "Get")
@@ -566,6 +686,8 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
                 arxiv_id,
                 staged_reactions=False,
                 group_message_id=message_id,
+                sender_open_id=sender_open_id,
+                sender_name=sender_name,
             )
     except Exception as e:
         logger.exception("Handler error: %s", e)
