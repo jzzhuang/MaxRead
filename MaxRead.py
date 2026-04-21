@@ -39,7 +39,7 @@ from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageReq
 from lark_oapi.api.contact.v3 import GetUserRequest
 
 from feishu.config import get_config
-from reader.arxiv_summarize import ArxivNotFoundError, extract_arxiv_ids, run_summarize
+from reader.arxiv_summarize import ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids, run_summarize
 from transform.feishu_doc import create_summary_doc, doc_url
 
 logging.basicConfig(
@@ -63,7 +63,7 @@ _feishu_api_lock = threading.Lock()
 
 # Background work so the WS handler returns immediately and new messages can be accepted.
 # At most 2 arXiv jobs run at once; additional work waits in a disk-backed queue so restart can resume them.
-_MAX_PARALLEL = 2
+_MAX_PARALLEL = 8
 _RESTART_DELAY_SECONDS = 3
 _restart_lock = threading.Lock()
 _restart_scheduled = False
@@ -593,6 +593,11 @@ def _process_one_arxiv_for_message(
 
         title = f"arXiv {arxiv_id} 摘要"
         paper_dir = _paper_dir_for_arxiv(arxiv_id)
+        is_pdf_source = (paper_dir / "paper.pdf").is_file()
+        is_txt_converted = (paper_dir / "paper.txt").is_file()
+        if is_pdf_source and is_txt_converted:
+            lines = summary.split("\n", 1)
+            summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格 和 图文对应可能不准）" + ("\n" + lines[1] if len(lines) > 1 else "")
         doc_id = None
         if _feishu_client:
             with _feishu_api_lock:
@@ -611,6 +616,11 @@ def _process_one_arxiv_for_message(
         logger.warning("arXiv 404: paper %s not found", arxiv_id)
         _reply_to_message(message_id, f"哥，我文章下载不了（arXiv {arxiv_id}）")
         _save_reply_time(arxiv_id, "not_found")
+        return
+    except PdfExtractionError as e:
+        logger.warning("PDF extraction failed for %s: %s", arxiv_id, e)
+        _reply_to_message(message_id, f"哥，这篇文章只有PDF没有源码，文字提取也失败了（arXiv {arxiv_id}）")
+        _save_reply_time(arxiv_id, "pdf_extraction_failed")
         return
     except Exception as e:
         logger.exception("Summarize/reply failed: %s", e)

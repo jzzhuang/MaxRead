@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Union
 
@@ -194,6 +195,8 @@ def _split_markdown_segments(
             flush_markdown()
             segments.append(("image", image))
             continue
+        if line.strip().startswith("## "):
+            flush_markdown()
         markdown_lines.append(line)
 
     flush_markdown()
@@ -222,6 +225,79 @@ def _extract_leading_h1_title(md_content: str) -> tuple[str | None, str]:
     return extracted_title or None, "\n".join(remaining_lines)
 
 
+_MAX_DESCENDANTS = 950
+
+
+def _split_large_table(markdown: str) -> list[str]:
+    """Split markdown containing large tables into smaller chunks.
+
+    The Feishu create_descendants API rejects requests with >1000 blocks.
+    A table with R rows and C columns generates ~R*C*2+1 blocks, so a
+    16-column, 36-row table easily exceeds the limit.  This function
+    detects such tables and splits them into multiple smaller tables,
+    each keeping the original header.
+    """
+    lines = markdown.split("\n")
+    chunks: list[str] = []
+    buf: list[str] = []
+
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip().startswith("|"):
+            buf.append(lines[i])
+            i += 1
+            continue
+
+        text = "\n".join(buf).strip()
+        if text:
+            chunks.append(text)
+        buf = []
+
+        table_start = i
+        while i < len(lines) and lines[i].strip().startswith("|"):
+            i += 1
+        table_lines = lines[table_start:i]
+
+        header_lines: list[str] = []
+        sep_line: str | None = None
+        sep_idx: int | None = None
+        for j, line in enumerate(table_lines):
+            if sep_line is None:
+                cells = line.strip().strip("|").split("|")
+                if all(re.fullmatch(r"\s*:?-+:?\s*", c) for c in cells):
+                    sep_line = line
+                    sep_idx = j
+                else:
+                    header_lines.append(line)
+
+        if sep_line is None or sep_idx is None or not header_lines:
+            chunks.append("\n".join(table_lines))
+            continue
+
+        data_lines = table_lines[sep_idx + 1:]
+        num_cols = max(1, header_lines[0].count("|") - 1)
+        total_rows = len(header_lines) + len(data_lines)
+        est_blocks = total_rows * num_cols * 2 + 1
+
+        if est_blocks <= _MAX_DESCENDANTS:
+            chunks.append("\n".join(table_lines))
+            continue
+
+        header_cost = len(header_lines) * num_cols * 2 + 1
+        row_cost = num_cols * 2
+        max_data = max(1, (_MAX_DESCENDANTS - header_cost) // row_cost)
+
+        for start in range(0, len(data_lines), max_data):
+            sub = header_lines + [sep_line] + data_lines[start : start + max_data]
+            chunks.append("\n".join(sub))
+
+    text = "\n".join(buf).strip()
+    if text:
+        chunks.append(text)
+
+    return chunks if chunks else [markdown]
+
+
 def _insert_markdown_chunk(
     client,
     document_id: str,
@@ -230,6 +306,13 @@ def _insert_markdown_chunk(
 ) -> int:
     if not markdown.strip():
         return 0
+
+    sub_chunks = _split_large_table(markdown)
+    if len(sub_chunks) > 1:
+        total = 0
+        for chunk in sub_chunks:
+            total += _insert_markdown_chunk(client, document_id, index + total, chunk)
+        return total
 
     convert_req = (
         ConvertDocumentRequest.builder()
@@ -260,11 +343,15 @@ def _insert_markdown_chunk(
     _strip_table_merge_info(descendants)
     add_resp = _create_block_descendants(client, document_id, index, first_level_ids, descendants)
     if getattr(add_resp, "code", 0) != 0:
+        block_types = [getattr(b, "block_type", None) for b in descendants]
         logger.warning(
-            "Add markdown descendants failed at index %s: %s %s",
+            "Add markdown descendants failed at index %s: %s %s\n"
+            "  block_types=%s\n  markdown=%r",
             index,
             getattr(add_resp, "code"),
             getattr(add_resp, "msg"),
+            block_types,
+            markdown[:500],
         )
         return 0
     return len(first_level_ids)
@@ -352,16 +439,24 @@ def _insert_image_block(
             .request_body(patch_body)
             .build()
         )
-        patch_resp = client.docx.v1.document_block.patch(patch_req)
-        if getattr(patch_resp, "code", 0) != 0:
-            logger.warning(
-                "Replace image failed for %s: %s %s",
-                upload_path,
-                getattr(patch_resp, "code"),
-                getattr(patch_resp, "msg"),
-            )
-            return False
-        return True
+        for attempt in range(5):
+            patch_resp = client.docx.v1.document_block.patch(patch_req)
+            if getattr(patch_resp, "code", 0) == 0:
+                return True
+            if attempt < 4:
+                logger.warning(
+                    "Replace image failed for %s (attempt %d/5): %s %s, retrying...",
+                    upload_path, attempt + 1,
+                    getattr(patch_resp, "code"), getattr(patch_resp, "msg"),
+                )
+                time.sleep(2)
+            else:
+                logger.warning(
+                    "Replace image failed for %s after 5 attempts: %s %s",
+                    upload_path,
+                    getattr(patch_resp, "code"), getattr(patch_resp, "msg"),
+                )
+        return False
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)

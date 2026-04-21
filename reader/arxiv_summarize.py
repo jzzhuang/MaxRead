@@ -11,11 +11,13 @@ Modes:
 """
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import gzip
 import tarfile
 import tempfile
 import zipfile
@@ -28,6 +30,107 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 PROMPT_FILE = Path(__file__).resolve().parent / "prompt.txt"
 CURSOR_KEY_FILE = Path(__file__).resolve().parent.parent / "cursor_api_key.txt"
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+# ---------------------------------------------------------------------------
+# Paper-directory size management
+# ---------------------------------------------------------------------------
+_JUNK_SUFFIXES = frozenset({
+    ".aux", ".log", ".out", ".brf", ".fls", ".fdb_latexmk",
+    ".synctex.gz", ".blg", ".toc", ".lof", ".lot",
+    ".nav", ".snm", ".vrb",
+    ".sty", ".cls", ".bst", ".def",
+    ".ttf", ".otf", ".pfb", ".tfm", ".vf", ".fd", ".mf",
+    ".eps", ".ps",
+})
+_IMAGE_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".tiff", ".bmp", ".svg",
+})
+_MAX_DIR_BYTES = 20 * 1024 * 1024   # 20 MB (leaves headroom for API overhead)
+_TARGET_DPI = 150
+_IMAGE_SHRINK_THRESHOLD = 300 * 1024  # shrink images larger than 300 KB
+_IMAGE_MAX_PIXELS = 1200              # longest-side cap when shrinking
+
+
+def _dir_size(paper_dir: Path) -> int:
+    return sum(f.stat().st_size for f in paper_dir.rglob("*") if f.is_file())
+
+
+def _convert_pdf_to_png(pdf_path: Path, dpi: int = _TARGET_DPI) -> None:
+    """Rasterise a PDF to PNG(s) at *dpi* and delete the original."""
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        zoom = dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=mat)
+            longest = max(pix.width, pix.height)
+            if longest > _IMAGE_MAX_PIXELS:
+                scale = _IMAGE_MAX_PIXELS / longest * zoom
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+            if len(doc) == 1:
+                out = pdf_path.with_suffix(".png")
+            else:
+                out = pdf_path.with_name(f"{pdf_path.stem}_p{i}.png")
+            pix.save(str(out))
+        doc.close()
+        pdf_path.unlink()
+    except Exception:
+        pass
+
+
+def _shrink_image(img_path: Path, max_pixels: int = _IMAGE_MAX_PIXELS) -> None:
+    """Down-sample an image so its longest side is at most *max_pixels*."""
+    try:
+        import fitz
+        pix = fitz.Pixmap(str(img_path))
+        longest = max(pix.width, pix.height)
+        factor = longest // max_pixels
+        if factor >= 2:
+            pix.shrink(factor)
+            pix.save(str(img_path))
+        while img_path.stat().st_size > _IMAGE_SHRINK_THRESHOLD and min(pix.width, pix.height) > 200:
+            pix.shrink(2)
+            pix.save(str(img_path))
+    except Exception:
+        pass
+
+
+def _trim_paper_dir(paper_dir: Path, max_bytes: int = _MAX_DIR_BYTES) -> None:
+    """Reduce a paper directory to fit within *max_bytes*."""
+    log = logging.getLogger("MaxRead")
+
+    for f in paper_dir.rglob("*"):
+        if f.is_file() and f.suffix.lower() in _JUNK_SUFFIXES:
+            f.unlink()
+
+    for f in list(paper_dir.rglob("*.pdf")):
+        if f.is_file():
+            _convert_pdf_to_png(f)
+
+    for f in paper_dir.rglob("*"):
+        if (
+            f.is_file()
+            and f.suffix.lower() in _IMAGE_SUFFIXES
+            and f.stat().st_size > _IMAGE_SHRINK_THRESHOLD
+        ):
+            _shrink_image(f)
+
+    total = _dir_size(paper_dir)
+    if total <= max_bytes:
+        return
+
+    images = sorted(
+        (f for f in paper_dir.rglob("*")
+         if f.is_file() and f.suffix.lower() in _IMAGE_SUFFIXES),
+        key=lambda f: f.stat().st_size,
+        reverse=True,
+    )
+    for img in images:
+        log.warning("[trim] Removing oversized image: %s (%d bytes)", img.name, img.stat().st_size)
+        img.unlink()
+        if _dir_size(paper_dir) <= max_bytes:
+            break
 
 
 def _load_claude_settings_env() -> dict:
@@ -215,20 +318,29 @@ class ArxivNotFoundError(Exception):
         super().__init__(f"arXiv e-print not found: {arxiv_id}")
 
 
+class PdfExtractionError(Exception):
+    """Raised when a PDF-only paper cannot be converted to readable text."""
+    pass
+
+
 def _verify_archive(path: Path) -> None:
     """Trial-open the downloaded archive to verify it's not truncated."""
     data = path.read_bytes()
     if len(data) == 0:
         raise IOError("Downloaded file is empty")
     if data[:2] == b"\x1f\x8b":  # gzip / tar.gz
-        with tarfile.open(path, "r:gz") as tf:
-            tf.getmembers()  # reads the full index; throws on truncation
+        try:
+            with tarfile.open(path, "r:gz") as tf:
+                tf.getmembers()
+        except tarfile.ReadError:
+            with gzip.open(path, "rb") as gz:
+                gz.read(1024)
     elif data[:2] == b"PK":  # zip
         with zipfile.ZipFile(path, "r") as zf:
             bad = zf.testzip()
             if bad is not None:
                 raise IOError(f"Corrupt entry in zip: {bad}")
-    # else: unknown format — let extract_archive() deal with it later
+    # else: PDF or plain text — extract_archive() handles it
 
 
 def download_source(arxiv_id: str, *, _max_retries: int = 3) -> Path:
@@ -291,18 +403,70 @@ def download_source(arxiv_id: str, *, _max_retries: int = 3) -> Path:
     return path  # unreachable, keeps type checkers happy
 
 
+def _pdf_to_text(pdf_path: Path, out_dir: Path) -> str:
+    """Extract text and images from a PDF using PyMuPDF. Returns the extracted text or raises PdfExtractionError."""
+    try:
+        import fitz
+    except ImportError:
+        raise PdfExtractionError("PyMuPDF (fitz) is not installed")
+    try:
+        doc = fitz.open(str(pdf_path))
+        pages = [page.get_text() for page in doc]
+        img_dir = out_dir / "images"
+        img_count = 0
+        for page_idx, page in enumerate(doc):
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                try:
+                    img_data = doc.extract_image(xref)
+                except Exception:
+                    continue
+                if not img_data or len(img_data["image"]) < 1024:
+                    continue
+                ext = img_data.get("ext", "png")
+                if ext not in ("png", "jpeg", "jpg"):
+                    continue
+                img_dir.mkdir(exist_ok=True)
+                img_count += 1
+                (img_dir / f"page{page_idx + 1}_{img_count}.{ext}").write_bytes(img_data["image"])
+        doc.close()
+        text = "\n\n".join(pages).strip()
+    except PdfExtractionError:
+        raise
+    except Exception as e:
+        raise PdfExtractionError(f"Failed to read PDF: {e}")
+    if len(text) < 200:
+        raise PdfExtractionError(f"Extracted text too short ({len(text)} chars), likely a scanned PDF")
+    return text
+
+
 def extract_archive(archive_path: Path, out_dir: Path) -> None:
-    """Extract .tar.gz or .zip to out_dir."""
+    """Extract .tar.gz, .zip, gzipped single file, PDF, or plain TeX to out_dir."""
     out_dir.mkdir(parents=True, exist_ok=True)
     data = archive_path.read_bytes()
     if data[:2] == b"\x1f\x8b":  # gzip
-        with tarfile.open(archive_path, "r:gz") as tf:
-            tf.extractall(out_dir)
+        try:
+            with tarfile.open(archive_path, "r:gz") as tf:
+                tf.extractall(out_dir)
+        except tarfile.ReadError:
+            with gzip.open(archive_path, "rb") as gz:
+                content = gz.read()
+            name = "main.tex" if b"\\documentclass" in content or b"\\begin{" in content else "paper.txt"
+            (out_dir / name).write_bytes(content)
     elif data[:2] == b"PK":
         with zipfile.ZipFile(archive_path, "r") as zf:
             zf.extractall(out_dir)
+    elif data[:4] == b"%PDF":
+        shutil.copy2(archive_path, out_dir / "paper.pdf")
+        text = _pdf_to_text(out_dir / "paper.pdf", out_dir)
+        (out_dir / "paper.txt").write_text(text, encoding="utf-8")
+    elif b"\\documentclass" in data[:4096] or b"\\begin{" in data[:4096]:
+        (out_dir / "main.tex").write_bytes(data)
     else:
-        raise ValueError("Unknown archive format (expected .tar.gz or .zip)")
+        shutil.copy2(archive_path, out_dir / "paper.bin")
+        logging.getLogger("MaxRead").warning(
+            "Unknown archive format (magic=%r), saved as paper.bin", data[:4],
+        )
 
 
 def launch_claude_in_folder(paper_dir: Path, prompt: str) -> str:
@@ -453,6 +617,8 @@ def run_summarize(
         extract_archive(archive_path, paper_dir)
         if queries_backup is not None:
             (paper_dir / "queries.json").write_bytes(queries_backup)
+        if _dir_size(paper_dir) > _MAX_DIR_BYTES:
+            _trim_paper_dir(paper_dir)
     finally:
         archive_path.unlink(missing_ok=True)
     _emit_progress(progress_callback, f"论文文件已准备完成：{paper_dir.name}")

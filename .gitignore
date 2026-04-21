@@ -7,3 +7,7 @@ cursor_api_key.txt
 
 mybot/
 errors/
+
+paper_ids.txt
+
+*.png
