@@ -46,6 +46,7 @@ from lark_oapi.api.drive.v1.model.permission_public_request import (
     PermissionPublicRequest,
 )
 
+
 from .constants import (
     DOCX_BLOCK_TYPE_IMAGE,
     DOCX_BLOCK_TYPE_GRID,

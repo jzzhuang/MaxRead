@@ -79,6 +79,115 @@ def _convert_pdf_to_png(pdf_path: Path, dpi: int = _TARGET_DPI) -> None:
         pass
 
 
+def _is_decorative_image(smask: int, img_bytes: bytes) -> bool:
+    """Return True if an extracted PDF image is a fill/mask from vector graphics."""
+    if smask <= 0:
+        return False
+    try:
+        import fitz
+        pix = fitz.Pixmap(img_bytes)
+        if pix.width < 20 or pix.height < 20:
+            return True
+        n = pix.n
+        total = pix.width * pix.height
+        step = max(1, total // 500)
+        colors: set[tuple[int, ...]] = set()
+        samples = pix.samples
+        for i in range(0, total, step):
+            off = i * n
+            if off + n <= len(samples):
+                colors.add(tuple(samples[off + c] >> 4 for c in range(n)))
+            if len(colors) >= 8:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+_FIGURE_CROP_DPI = 200
+_FIGURE_CAPTION_RE = re.compile(r"^(Figure|Fig\.?)\s+\d+", re.I)
+
+
+def _find_figure_captions(page):
+    """Return a list of Rects for figure caption text blocks on a page."""
+    import fitz as _fitz
+    captions = []
+    for b in page.get_text("blocks"):
+        x0, y0, x1, y1, text, _bn, _bt = b
+        if _FIGURE_CAPTION_RE.match(text.strip()):
+            captions.append(_fitz.Rect(x0, y0, x1, y1))
+    return captions
+
+
+def _trim_whitespace(img_path: Path, padding: int = 4) -> None:
+    """Remove white borders from a saved image file."""
+    from PIL import Image, ImageOps
+
+    img = Image.open(img_path).convert("RGB")
+    bbox = ImageOps.invert(img).getbbox()
+    if not bbox:
+        return
+    bbox = (
+        max(0, bbox[0] - padding),
+        max(0, bbox[1] - padding),
+        min(img.width, bbox[2] + padding),
+        min(img.height, bbox[3] + padding),
+    )
+    img.crop(bbox).save(img_path)
+
+
+def _crop_figure_region(page, caption_rect, hint_rect=None, dpi: int = _FIGURE_CROP_DPI):
+    """Render the figure area above a caption.
+
+    hint_rect: union of decorative-image or drawing rects that approximate the figure location.
+    """
+    import fitz as _fitz
+
+    page_rect = page.rect
+
+    y_bottom = caption_rect.y0
+
+    if hint_rect:
+        y_top = max(page_rect.y0, hint_rect.y0 - 5)
+    else:
+        y_top = page_rect.y0
+
+    text_blocks = page.get_text("blocks")
+    for b in sorted(text_blocks, key=lambda b: b[1]):
+        _x0, y0, _x1, y1, text, _bn, _bt = b
+        if y0 >= caption_rect.y0 - 10:
+            break
+        stripped = text.strip()
+        lines = stripped.split("\n")
+        avg_line_len = len(stripped) / len(lines) if lines else 0
+        if avg_line_len > 50:
+            y_top = y1 + 3
+
+    for b in sorted(text_blocks, key=lambda b: b[1], reverse=True):
+        _x0, y0, _x1, y1, text, _bn, _bt = b
+        if y0 >= y_top:
+            continue
+        if y_top - y0 > 15:
+            break
+        stripped = text.strip()
+        lines = stripped.split("\n")
+        avg_line_len = len(stripped) / len(lines) if lines else 0
+        if avg_line_len <= 50:
+            y_top = y0
+
+    clip = _fitz.Rect(
+        page_rect.x0,
+        max(page_rect.y0, y_top),
+        page_rect.x1,
+        min(page_rect.y1, y_bottom),
+    )
+
+    zoom = dpi / 72
+    mat = _fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(clip=clip, matrix=mat)
+    return pix
+
+
 def _shrink_image(img_path: Path, max_pixels: int = _IMAGE_MAX_PIXELS) -> None:
     """Down-sample an image so its longest side is at most *max_pixels*."""
     try:
@@ -431,8 +540,12 @@ def _pdf_to_text(pdf_path: Path, out_dir: Path) -> str:
         img_dir = out_dir / "images"
         img_count = 0
         for page_idx, page in enumerate(doc):
+            good_images: list[tuple[str, bytes]] = []
+            deco_rects: list = []
+
             for img_info in page.get_images(full=True):
                 xref = img_info[0]
+                smask = img_info[1]
                 try:
                     img_data = doc.extract_image(xref)
                 except Exception:
@@ -442,9 +555,39 @@ def _pdf_to_text(pdf_path: Path, out_dir: Path) -> str:
                 ext = img_data.get("ext", "png")
                 if ext not in ("png", "jpeg", "jpg"):
                     continue
+                if _is_decorative_image(smask, img_data["image"]):
+                    for r in page.get_image_rects(xref):
+                        deco_rects.append(r)
+                    continue
+                good_images.append((ext, img_data["image"]))
+
+            for ext, data in good_images:
                 img_dir.mkdir(exist_ok=True)
                 img_count += 1
-                (img_dir / f"page{page_idx + 1}_{img_count}.{ext}").write_bytes(img_data["image"])
+                (img_dir / f"page{page_idx + 1}_{img_count}.{ext}").write_bytes(data)
+
+            if not good_images:
+                captions = _find_figure_captions(page)
+                for cap_rect in captions:
+                    hints: list = list(deco_rects)
+                    for d in page.get_drawings():
+                        dr = fitz.Rect(d["rect"])
+                        if dr.y0 < cap_rect.y0 + 10:
+                            hints.append(dr)
+                    if not hints:
+                        continue
+                    hint_union = hints[0]
+                    for r in hints[1:]:
+                        hint_union = hint_union | r
+                    try:
+                        pix = _crop_figure_region(page, cap_rect, hint_union)
+                        img_dir.mkdir(exist_ok=True)
+                        img_count += 1
+                        fig_path = img_dir / f"page{page_idx + 1}_{img_count}_fig.png"
+                        pix.save(str(fig_path))
+                        _trim_whitespace(fig_path)
+                    except Exception:
+                        pass
         doc.close()
         text = "\n\n".join(pages).strip()
     except PdfExtractionError:
