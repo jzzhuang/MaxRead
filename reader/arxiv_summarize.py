@@ -96,6 +96,22 @@ def _shrink_image(img_path: Path, max_pixels: int = _IMAGE_MAX_PIXELS) -> None:
         pass
 
 
+def _convert_figure_pdfs(paper_dir: Path) -> None:
+    """Convert single-page PDFs (likely figures) to PNG and remove originals."""
+    for pdf in list(paper_dir.rglob("*.pdf")):
+        if not pdf.is_file() or pdf.name == "paper.pdf":
+            continue
+        try:
+            import fitz
+            doc = fitz.open(str(pdf))
+            page_count = len(doc)
+            doc.close()
+            if page_count == 1:
+                _convert_pdf_to_png(pdf)
+        except Exception:
+            pass
+
+
 def _trim_paper_dir(paper_dir: Path, max_bytes: int = _MAX_DIR_BYTES) -> None:
     """Reduce a paper directory to fit within *max_bytes*."""
     log = logging.getLogger("MaxRead")
@@ -617,6 +633,7 @@ def run_summarize(
         extract_archive(archive_path, paper_dir)
         if queries_backup is not None:
             (paper_dir / "queries.json").write_bytes(queries_backup)
+        _convert_figure_pdfs(paper_dir)
         if _dir_size(paper_dir) > _MAX_DIR_BYTES:
             _trim_paper_dir(paper_dir)
     finally:

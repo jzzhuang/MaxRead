@@ -39,6 +39,7 @@ from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageReq
 from lark_oapi.api.contact.v3 import GetUserRequest
 
 from feishu.config import get_config
+from feishu.resilient import call_api
 from reader.arxiv_summarize import ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids, run_summarize
 from transform.feishu_doc import create_summary_doc, doc_url
 
@@ -64,6 +65,7 @@ _feishu_api_lock = threading.Lock()
 # Background work so the WS handler returns immediately and new messages can be accepted.
 # At most 2 arXiv jobs run at once; additional work waits in a disk-backed queue so restart can resume them.
 _MAX_PARALLEL = 8
+_MAX_JOB_RETRIES = 5
 _RESTART_DELAY_SECONDS = 3
 _restart_lock = threading.Lock()
 _restart_scheduled = False
@@ -266,13 +268,20 @@ def _queue_worker() -> None:
             # Don't requeue — let it complete and be removed
         except Exception as e:
             logger.exception("Queue worker failed for %s: %s", running_path.name, e)
-            logger.warning(
-                "Requeueing failed job at end: message=%s arXiv=%s",
-                job.get("message_id"),
-                job.get("arxiv_id"),
-            )
-            _requeue_job_at_end(running_path, job, note=f"Job failed: {type(e).__name__}")
-            preserve_running_job = True
+            retry_count = int(job.get("retry_count") or 0)
+            arxiv_id = str(job.get("arxiv_id", "unknown"))
+            message_id = str(job.get("message_id", ""))
+            if retry_count >= _MAX_JOB_RETRIES:
+                logger.error("Job exceeded max retries (%d): arXiv %s", _MAX_JOB_RETRIES, arxiv_id)
+                if message_id:
+                    _reply_to_message(message_id, f"哥，试了 {retry_count} 次还是不行，先放弃了（arXiv {arxiv_id}）")
+            else:
+                logger.warning(
+                    "Requeueing failed job at end (retry %d/%d): message=%s arXiv=%s",
+                    retry_count + 1, _MAX_JOB_RETRIES, job.get("message_id"), arxiv_id,
+                )
+                _requeue_job_at_end(running_path, job, note=f"Job failed: {type(e).__name__}")
+                preserve_running_job = True
         finally:
             if not preserve_running_job and running_path.exists():
                 _complete_job(running_path)
@@ -353,8 +362,7 @@ def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = Tru
     )
     req = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
     try:
-        with _feishu_api_lock:
-            resp = _feishu_client.im.v1.message.reply(req)
+        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message.reply, req)
         if resp and getattr(resp, "code", 0) != 0:
             logger.warning("Reply API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
         else:
@@ -379,8 +387,7 @@ def _add_reaction(message_id: str, emoji_type: str) -> str | None:
             .request_body(body)
             .build()
         )
-        with _feishu_api_lock:
-            resp = _feishu_client.im.v1.message_reaction.create(req)
+        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message_reaction.create, req)
         if resp and getattr(resp, "code", 0) == 0:
             reaction_id = getattr(getattr(resp, "data", None), "reaction_id", None)
             logger.info("Added reaction %s to %s", emoji_type, message_id)
@@ -406,8 +413,7 @@ def _remove_reaction(message_id: str, reaction_id: str | None) -> None:
             .reaction_id(reaction_id)
             .build()
         )
-        with _feishu_api_lock:
-            resp = _feishu_client.im.v1.message_reaction.delete(req)
+        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message_reaction.delete, req)
         if resp and getattr(resp, "code", 0) != 0:
             logger.warning(
                 "Delete reaction API code: %s msg: %s",
@@ -436,8 +442,7 @@ def _fetch_user_name(open_id: str) -> str | None:
             .user_id_type("open_id")
             .build()
         )
-        with _feishu_api_lock:
-            resp = _feishu_client.contact.v3.user.get(req)
+        resp = call_api(_feishu_api_lock, _feishu_client.contact.v3.user.get, req)
         if resp and getattr(resp, "code", 0) == 0:
             user = getattr(getattr(resp, "data", None), "user", None)
             return getattr(user, "name", None) if user else None
@@ -600,10 +605,10 @@ def _process_one_arxiv_for_message(
             summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格 和 图文对应可能不准）" + ("\n" + lines[1] if len(lines) > 1 else "")
         doc_id = None
         if _feishu_client:
-            with _feishu_api_lock:
-                doc_id = create_summary_doc(
-                    _feishu_client, title, summary, base_dir=paper_dir, arxiv_id=arxiv_id
-                )
+            doc_id = create_summary_doc(
+                _feishu_client, title, summary, base_dir=paper_dir, arxiv_id=arxiv_id,
+                api_lock=_feishu_api_lock,
+            )
         if doc_id:
             document_link = doc_url(doc_id, tenant_key)
             _save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
@@ -730,6 +735,11 @@ def main() -> None:
         log_level=lark.LogLevel.INFO,
         auto_reconnect=True,
     )
+    # Lark SDK 默认 120s ping，NAT 网关常在 60-90s 后断连。
+    # 缩短 ping 保活、加快断线检测、加快重连。
+    ws._ping_interval = 30
+    ws._reconnect_interval = 10
+    ws._reconnect_nonce = 3
     logger.info("MaxRead 已启动：收到含 arXiv 链接的消息将自动下载并总结后回复。")
     ws.start()
 

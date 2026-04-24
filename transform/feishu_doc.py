@@ -2,11 +2,13 @@
 Build Feishu docx blocks from parsed (block_type, content) and create cloud docs.
 Supports inline bold/italic, bullet/ordered lists, and native tables.
 """
+from __future__ import annotations
+
 import logging
 import re
 import shutil
 import tempfile
-import time
+import threading
 from pathlib import Path
 from typing import Union
 
@@ -46,7 +48,10 @@ from lark_oapi.api.drive.v1.model.permission_public_request import (
 
 from .constants import (
     DOCX_BLOCK_TYPE_IMAGE,
+    DOCX_BLOCK_TYPE_GRID,
 )
+
+from feishu.resilient import call_api
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +121,7 @@ def _prepare_upload_image(image_path: Path) -> tuple[Path, str | None]:
     return png_path, temp_dir
 
 
-def _create_block_child(client, document_id: str, index: int, block: Block):
+def _create_block_child(client, document_id: str, index: int, block: Block, api_lock: threading.Lock | None = None):
     children_body = (
         CreateDocumentBlockChildrenRequestBody.builder()
         .children([block])
@@ -130,7 +135,7 @@ def _create_block_child(client, document_id: str, index: int, block: Block):
         .request_body(children_body)
         .build()
     )
-    return client.docx.v1.document_block_children.create(add_req)
+    return call_api(api_lock, client.docx.v1.document_block_children.create, add_req)
 
 
 def _create_block_descendants(
@@ -139,6 +144,7 @@ def _create_block_descendants(
     index: int,
     children_id: list[str],
     descendants: list[Block],
+    api_lock: threading.Lock | None = None,
 ):
     add_req = (
         CreateDocumentBlockDescendantRequest.builder()
@@ -154,7 +160,7 @@ def _create_block_descendants(
         )
         .build()
     )
-    return client.docx.v1.document_block_descendant.create(add_req)
+    return call_api(api_lock, client.docx.v1.document_block_descendant.create, add_req)
 
 
 def _strip_table_merge_info(blocks: list[Block]) -> None:
@@ -303,6 +309,7 @@ def _insert_markdown_chunk(
     document_id: str,
     index: int,
     markdown: str,
+    api_lock: threading.Lock | None = None,
 ) -> int:
     if not markdown.strip():
         return 0
@@ -311,7 +318,7 @@ def _insert_markdown_chunk(
     if len(sub_chunks) > 1:
         total = 0
         for chunk in sub_chunks:
-            total += _insert_markdown_chunk(client, document_id, index + total, chunk)
+            total += _insert_markdown_chunk(client, document_id, index + total, chunk, api_lock)
         return total
 
     convert_req = (
@@ -324,7 +331,7 @@ def _insert_markdown_chunk(
         )
         .build()
     )
-    convert_resp = client.docx.v1.document.convert(convert_req)
+    convert_resp = call_api(api_lock, client.docx.v1.document.convert, convert_req)
     if getattr(convert_resp, "code", 0) != 0:
         logger.warning(
             "Convert markdown failed at index %s: %s %s",
@@ -341,7 +348,7 @@ def _insert_markdown_chunk(
         return 0
 
     _strip_table_merge_info(descendants)
-    add_resp = _create_block_descendants(client, document_id, index, first_level_ids, descendants)
+    add_resp = _create_block_descendants(client, document_id, index, first_level_ids, descendants, api_lock)
     if getattr(add_resp, "code", 0) != 0:
         block_types = [getattr(b, "block_type", None) for b in descendants]
         logger.warning(
@@ -357,42 +364,14 @@ def _insert_markdown_chunk(
     return len(first_level_ids)
 
 
-def _insert_image_block(
+def _upload_and_patch_image(
     client,
     document_id: str,
-    index: int,
-    content: BlockContent,
-    base_dir: Path | None,
+    block_id: str,
+    image_path: Path,
+    api_lock: threading.Lock | None = None,
 ) -> bool:
-    if not isinstance(content, dict):
-        return False
-
-    raw_path = str(content.get("path") or "").strip()
-    if not raw_path:
-        return False
-
-    image_path = _resolve_image_path(raw_path, base_dir)
-    if image_path is None:
-        logger.warning("Image file not found for Feishu upload: %s", raw_path)
-        return False
-
-    image_block = Block.builder().block_type(DOCX_BLOCK_TYPE_IMAGE).image(Image.builder().build()).build()
-    create_resp = _create_block_child(client, document_id, index, image_block)
-    if getattr(create_resp, "code", 0) != 0:
-        logger.warning(
-            "Create image block failed at index %s: %s %s",
-            index,
-            getattr(create_resp, "code"),
-            getattr(create_resp, "msg"),
-        )
-        return False
-
-    children = getattr(getattr(create_resp, "data", None), "children", None) or []
-    block_id = getattr(children[0], "block_id", None) if children else None
-    if not block_id:
-        logger.warning("Create image block returned no block_id at index %s", index)
-        return False
-
+    """Upload an image file to an existing image block and patch it with the file token."""
     upload_path = image_path
     temp_dir: str | None = None
     try:
@@ -409,7 +388,7 @@ def _insert_image_block(
                 .request_body(upload_body)
                 .build()
             )
-            upload_resp = client.drive.v1.media.upload_all(upload_req)
+            upload_resp = call_api(api_lock, client.drive.v1.media.upload_all, upload_req)
 
         if getattr(upload_resp, "code", 0) != 0:
             logger.warning(
@@ -439,27 +418,163 @@ def _insert_image_block(
             .request_body(patch_body)
             .build()
         )
-        for attempt in range(5):
-            patch_resp = client.docx.v1.document_block.patch(patch_req)
-            if getattr(patch_resp, "code", 0) == 0:
-                return True
-            if attempt < 4:
-                logger.warning(
-                    "Replace image failed for %s (attempt %d/5): %s %s, retrying...",
-                    upload_path, attempt + 1,
-                    getattr(patch_resp, "code"), getattr(patch_resp, "msg"),
-                )
-                time.sleep(2)
-            else:
-                logger.warning(
-                    "Replace image failed for %s after 5 attempts: %s %s",
-                    upload_path,
-                    getattr(patch_resp, "code"), getattr(patch_resp, "msg"),
-                )
-        return False
+        patch_resp = call_api(api_lock, client.docx.v1.document_block.patch, patch_req, retries=5, backoff=2.0)
+        return getattr(patch_resp, "code", -1) == 0
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _insert_image_block(
+    client,
+    document_id: str,
+    index: int,
+    content: BlockContent,
+    base_dir: Path | None,
+    api_lock: threading.Lock | None = None,
+) -> bool:
+    if not isinstance(content, dict):
+        return False
+
+    raw_path = str(content.get("path") or "").strip()
+    if not raw_path:
+        return False
+
+    image_path = _resolve_image_path(raw_path, base_dir)
+    if image_path is None:
+        logger.warning("Image file not found for Feishu upload: %s", raw_path)
+        return False
+
+    image_block = Block.builder().block_type(DOCX_BLOCK_TYPE_IMAGE).image(Image.builder().build()).build()
+    create_resp = _create_block_child(client, document_id, index, image_block, api_lock)
+    if getattr(create_resp, "code", 0) != 0:
+        logger.warning(
+            "Create image block failed at index %s: %s %s",
+            index,
+            getattr(create_resp, "code"),
+            getattr(create_resp, "msg"),
+        )
+        return False
+
+    children = getattr(getattr(create_resp, "data", None), "children", None) or []
+    block_id = getattr(children[0], "block_id", None) if children else None
+    if not block_id:
+        logger.warning("Create image block returned no block_id at index %s", index)
+        return False
+
+    return _upload_and_patch_image(client, document_id, block_id, image_path, api_lock)
+
+
+_MAX_GRID_COLUMNS = 5
+
+
+def _insert_image_grid(
+    client,
+    document_id: str,
+    index: int,
+    images: list[BlockContent],
+    base_dir: Path | None,
+    api_lock: threading.Lock | None = None,
+) -> bool:
+    """Insert multiple images side-by-side using a Feishu grid block."""
+    from lark_oapi.api.docx.v1.model.grid import Grid
+    from lark_oapi.api.docx.v1.model.get_document_block_children_request import (
+        GetDocumentBlockChildrenRequest,
+    )
+
+    valid: list[Path] = []
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        raw_path = str(img.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = _resolve_image_path(raw_path, base_dir)
+        if path is not None:
+            valid.append(path)
+
+    if not valid:
+        return False
+
+    n = min(len(valid), _MAX_GRID_COLUMNS)
+    valid = valid[:n]
+
+    grid_block = (
+        Block.builder()
+        .block_type(DOCX_BLOCK_TYPE_GRID)
+        .grid(Grid.builder().column_size(n).build())
+        .build()
+    )
+    grid_resp = _create_block_child(client, document_id, index, grid_block, api_lock)
+    if getattr(grid_resp, "code", 0) != 0:
+        logger.warning(
+            "Create grid block failed: %s %s",
+            getattr(grid_resp, "code"),
+            getattr(grid_resp, "msg"),
+        )
+        return False
+
+    resp_children = getattr(getattr(grid_resp, "data", None), "children", None) or []
+    grid_obj = resp_children[0] if resp_children else None
+    grid_block_id = getattr(grid_obj, "block_id", None) if grid_obj else None
+    if not grid_block_id:
+        logger.warning("Create grid block returned no block_id")
+        return False
+
+    column_ids = getattr(grid_obj, "children", None) or []
+    if len(column_ids) < n:
+        get_req = (
+            GetDocumentBlockChildrenRequest.builder()
+            .document_id(document_id)
+            .block_id(grid_block_id)
+            .build()
+        )
+        get_resp = call_api(api_lock, client.docx.v1.document_block_children.get, get_req)
+        if getattr(get_resp, "code", 0) != 0:
+            logger.warning(
+                "Get grid column children failed: %s %s",
+                getattr(get_resp, "code"),
+                getattr(get_resp, "msg"),
+            )
+            return False
+        items = getattr(getattr(get_resp, "data", None), "items", None) or []
+        column_ids = [getattr(item, "block_id", None) for item in items]
+
+    if len(column_ids) < n:
+        logger.warning("Grid has %d columns, expected %d", len(column_ids), n)
+        return False
+
+    all_ok = True
+    for img_path, col_id in zip(valid, column_ids):
+        img_block = Block.builder().block_type(DOCX_BLOCK_TYPE_IMAGE).image(Image.builder().build()).build()
+        child_body = (
+            CreateDocumentBlockChildrenRequestBody.builder()
+            .children([img_block])
+            .index(0)
+            .build()
+        )
+        child_req = (
+            CreateDocumentBlockChildrenRequest.builder()
+            .document_id(document_id)
+            .block_id(col_id)
+            .request_body(child_body)
+            .build()
+        )
+        child_resp = call_api(api_lock, client.docx.v1.document_block_children.create, child_req)
+        if getattr(child_resp, "code", 0) != 0:
+            all_ok = False
+            continue
+
+        img_children = getattr(getattr(child_resp, "data", None), "children", None) or []
+        img_block_id = getattr(img_children[0], "block_id", None) if img_children else None
+        if not img_block_id:
+            all_ok = False
+            continue
+
+        if not _upload_and_patch_image(client, document_id, img_block_id, img_path, api_lock):
+            all_ok = False
+
+    return all_ok
 
 
 def create_summary_doc(
@@ -469,6 +584,7 @@ def create_summary_doc(
     *,
     base_dir: str | Path | None = None,
     arxiv_id: str | None = None,
+    api_lock: threading.Lock | None = None,
 ) -> str | None:
     """
     Create a cloud doc (云文档) from Markdown summary with sections, text, equations,
@@ -487,7 +603,7 @@ def create_summary_doc(
             .build()
         )
         req = CreateDocumentRequest.builder().request_body(body).build()
-        resp = client.docx.v1.document.create(req)
+        resp = call_api(api_lock, client.docx.v1.document.create, req)
         if getattr(resp, "code", 0) != 0:
             logger.warning("Create doc failed: %s %s", getattr(resp, "code"), getattr(resp, "msg"))
             return None
@@ -511,7 +627,7 @@ def create_summary_doc(
             )
             .build()
         )
-        permission_resp = client.drive.v1.permission_public.patch(permission_req)
+        permission_resp = call_api(api_lock, client.drive.v1.permission_public.patch, permission_req)
         if getattr(permission_resp, "code", 0) != 0:
             logger.warning(
                 "Set doc public-edit permission failed: %s %s",
@@ -524,17 +640,35 @@ def create_summary_doc(
             segments = [("markdown", normalized_md_content.strip() or "（无内容）")]
 
         insert_index = 0
-        for segment_type, content in segments:
-            if segment_type == "markdown":
-                insert_index += _insert_markdown_chunk(client, document_id, insert_index, str(content))
+        seg_i = 0
+        while seg_i < len(segments):
+            seg_type, content = segments[seg_i]
+            if seg_type == "markdown":
+                insert_index += _insert_markdown_chunk(client, document_id, insert_index, str(content), api_lock)
+                seg_i += 1
                 continue
 
-            if _insert_image_block(client, document_id, insert_index, content, resolved_base_dir):
-                insert_index += 1
-                continue
+            image_group: list[BlockContent] = []
+            while seg_i < len(segments) and segments[seg_i][0] == "image":
+                image_group.append(segments[seg_i][1])
+                seg_i += 1
 
-            fallback = _markdown_image_fallback(content) or "（图片上传失败）"
-            insert_index += _insert_markdown_chunk(client, document_id, insert_index, fallback)
+            if len(image_group) == 1:
+                if _insert_image_block(client, document_id, insert_index, image_group[0], resolved_base_dir, api_lock):
+                    insert_index += 1
+                else:
+                    fallback = _markdown_image_fallback(image_group[0]) or "（图片上传失败）"
+                    insert_index += _insert_markdown_chunk(client, document_id, insert_index, fallback, api_lock)
+            else:
+                if not _insert_image_grid(client, document_id, insert_index, image_group, resolved_base_dir, api_lock):
+                    for img_content in image_group:
+                        if _insert_image_block(client, document_id, insert_index, img_content, resolved_base_dir, api_lock):
+                            insert_index += 1
+                        else:
+                            fallback = _markdown_image_fallback(img_content) or "（图片上传失败）"
+                            insert_index += _insert_markdown_chunk(client, document_id, insert_index, fallback, api_lock)
+                else:
+                    insert_index += 1
         return document_id
     except Exception as e:
         logger.exception("Create summary doc failed: %s", e)

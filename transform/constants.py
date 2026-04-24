@@ -11,6 +11,8 @@ DOCX_BLOCK_TYPE_ORDERED = 13
 DOCX_BLOCK_TYPE_DIVIDER = 22
 DOCX_BLOCK_TYPE_TABLE = 31
 DOCX_BLOCK_TYPE_CODE = 14
+DOCX_BLOCK_TYPE_GRID = 24
+DOCX_BLOCK_TYPE_GRID_COLUMN = 25
 DOCX_BLOCK_TYPE_IMAGE = 27
 
 # Table total width to match document content width on desktop (Feishu column_width units).
