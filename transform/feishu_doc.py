@@ -305,6 +305,34 @@ def _split_large_table(markdown: str) -> list[str]:
     return chunks if chunks else [markdown]
 
 
+_DISPLAY_MATH_RE = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
+_INLINE_MATH_RE = re.compile(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)')
+
+
+def _escape_math_angle_brackets(markdown: str) -> str:
+    """Replace bare ``<``/``>`` inside LaTeX math with ``\\lt``/``\\gt``
+    so that Feishu's Markdown converter does not strip them as HTML tags.
+
+    Without this, a formula like ``$P_{<t}$`` is mangled: Feishu interprets
+    ``<t>`` as an HTML tag, removes it, and leaves an unclosed brace that
+    swallows the surrounding text.
+    """
+
+    def _replace(m: re.Match) -> str:
+        full = m.group(0)
+        if full.startswith('$$'):
+            delim, inner = '$$', full[2:-2]
+        else:
+            delim, inner = '$', full[1:-1]
+        inner = inner.replace('<', '\\lt ')
+        inner = inner.replace('>', '\\gt ')
+        return delim + inner + delim
+
+    result = _DISPLAY_MATH_RE.sub(_replace, markdown)
+    result = _INLINE_MATH_RE.sub(_replace, result)
+    return result
+
+
 def _insert_markdown_chunk(
     client,
     document_id: str,
@@ -321,6 +349,8 @@ def _insert_markdown_chunk(
         for chunk in sub_chunks:
             total += _insert_markdown_chunk(client, document_id, index + total, chunk, api_lock)
         return total
+
+    markdown = _escape_math_angle_brackets(markdown)
 
     convert_req = (
         ConvertDocumentRequest.builder()

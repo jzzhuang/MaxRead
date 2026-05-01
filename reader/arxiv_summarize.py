@@ -79,113 +79,63 @@ def _convert_pdf_to_png(pdf_path: Path, dpi: int = _TARGET_DPI) -> None:
         pass
 
 
-def _is_decorative_image(smask: int, img_bytes: bytes) -> bool:
-    """Return True if an extracted PDF image is a fill/mask from vector graphics."""
-    if smask <= 0:
-        return False
+def _is_formula_image(img_path: Path) -> bool:
+    """Return True if the image is likely a mathematical formula rather than a figure."""
     try:
         import fitz
-        pix = fitz.Pixmap(img_bytes)
-        if pix.width < 20 or pix.height < 20:
+        pix = fitz.Pixmap(str(img_path))
+        w, h = pix.width, pix.height
+
+        if w * h < 5000:
             return True
+
+        ratio = w / max(h, 1)
+
+        if h < 60 and ratio > 5:
+            return True
+
         n = pix.n
-        total = pix.width * pix.height
-        step = max(1, total // 500)
-        colors: set[tuple[int, ...]] = set()
+        total = w * h
+        step = max(1, total // 1000)
         samples = pix.samples
+        black = white = other = 0
         for i in range(0, total, step):
             off = i * n
-            if off + n <= len(samples):
-                colors.add(tuple(samples[off + c] >> 4 for c in range(n)))
-            if len(colors) >= 8:
-                return False
-        return True
+            if off + n > len(samples):
+                break
+            channels = [samples[off + c] for c in range(min(n, 3))]
+            brightness = sum(channels) / len(channels)
+            if brightness < 30:
+                black += 1
+            elif brightness > 225:
+                white += 1
+            else:
+                other += 1
+        sampled = black + white + other
+        if sampled == 0:
+            return False
+
+        bw_ratio = (black + white) / sampled
+        if bw_ratio > 0.90 and h < 130 and ratio > 4:
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
-_FIGURE_CROP_DPI = 200
-_FIGURE_CAPTION_RE = re.compile(r"^(Figure|Fig\.?)\s+\d+", re.I)
-
-
-def _find_figure_captions(page):
-    """Return a list of Rects for figure caption text blocks on a page."""
-    import fitz as _fitz
-    captions = []
-    for b in page.get_text("blocks"):
-        x0, y0, x1, y1, text, _bn, _bt = b
-        if _FIGURE_CAPTION_RE.match(text.strip()):
-            captions.append(_fitz.Rect(x0, y0, x1, y1))
-    return captions
-
-
-def _trim_whitespace(img_path: Path, padding: int = 4) -> None:
-    """Remove white borders from a saved image file."""
-    from PIL import Image, ImageOps
-
-    img = Image.open(img_path).convert("RGB")
-    bbox = ImageOps.invert(img).getbbox()
-    if not bbox:
-        return
-    bbox = (
-        max(0, bbox[0] - padding),
-        max(0, bbox[1] - padding),
-        min(img.width, bbox[2] + padding),
-        min(img.height, bbox[3] + padding),
-    )
-    img.crop(bbox).save(img_path)
-
-
-def _crop_figure_region(page, caption_rect, hint_rect=None, dpi: int = _FIGURE_CROP_DPI):
-    """Render the figure area above a caption.
-
-    hint_rect: union of decorative-image or drawing rects that approximate the figure location.
-    """
-    import fitz as _fitz
-
-    page_rect = page.rect
-
-    y_bottom = caption_rect.y0
-
-    if hint_rect:
-        y_top = max(page_rect.y0, hint_rect.y0 - 5)
-    else:
-        y_top = page_rect.y0
-
-    text_blocks = page.get_text("blocks")
-    for b in sorted(text_blocks, key=lambda b: b[1]):
-        _x0, y0, _x1, y1, text, _bn, _bt = b
-        if y0 >= caption_rect.y0 - 10:
-            break
-        stripped = text.strip()
-        lines = stripped.split("\n")
-        avg_line_len = len(stripped) / len(lines) if lines else 0
-        if avg_line_len > 50:
-            y_top = y1 + 3
-
-    for b in sorted(text_blocks, key=lambda b: b[1], reverse=True):
-        _x0, y0, _x1, y1, text, _bn, _bt = b
-        if y0 >= y_top:
+def _filter_formula_images(img_dir: Path, md_text: str) -> str:
+    """Remove formula images from disk and their references from Markdown."""
+    removed = []
+    for f in sorted(img_dir.iterdir()):
+        if f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
             continue
-        if y_top - y0 > 15:
-            break
-        stripped = text.strip()
-        lines = stripped.split("\n")
-        avg_line_len = len(stripped) / len(lines) if lines else 0
-        if avg_line_len <= 50:
-            y_top = y0
-
-    clip = _fitz.Rect(
-        page_rect.x0,
-        max(page_rect.y0, y_top),
-        page_rect.x1,
-        min(page_rect.y1, y_bottom),
-    )
-
-    zoom = dpi / 72
-    mat = _fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(clip=clip, matrix=mat)
-    return pix
+        if _is_formula_image(f):
+            removed.append(f.name)
+            f.unlink()
+    for name in removed:
+        md_text = md_text.replace(f"![](images/{name})", "")
+    md_text = re.sub(r"\n{3,}", "\n\n", md_text)
+    return md_text
 
 
 def _shrink_image(img_path: Path, max_pixels: int = _IMAGE_MAX_PIXELS) -> None:
@@ -529,74 +479,36 @@ def download_source(arxiv_id: str, *, _max_retries: int = 3) -> Path:
 
 
 def _pdf_to_text(pdf_path: Path, out_dir: Path) -> str:
-    """Extract text and images from a PDF using PyMuPDF. Returns the extracted text or raises PdfExtractionError."""
+    """Extract text and images from a PDF as Markdown. Returns Markdown with inline image refs or raises PdfExtractionError."""
+    try:
+        import pymupdf4llm
+    except ImportError:
+        raise PdfExtractionError("pymupdf4llm is not installed")
     try:
         import fitz
     except ImportError:
         raise PdfExtractionError("PyMuPDF (fitz) is not installed")
     try:
-        doc = fitz.open(str(pdf_path))
-        pages = [page.get_text() for page in doc]
         img_dir = out_dir / "images"
-        img_count = 0
-        for page_idx, page in enumerate(doc):
-            good_images: list[tuple[str, bytes]] = []
-            deco_rects: list = []
+        img_dir.mkdir(exist_ok=True)
 
-            for img_info in page.get_images(full=True):
-                xref = img_info[0]
-                smask = img_info[1]
-                try:
-                    img_data = doc.extract_image(xref)
-                except Exception:
-                    continue
-                if not img_data or len(img_data["image"]) < 1024:
-                    continue
-                ext = img_data.get("ext", "png")
-                if ext not in ("png", "jpeg", "jpg"):
-                    continue
-                if _is_decorative_image(smask, img_data["image"]):
-                    for r in page.get_image_rects(xref):
-                        deco_rects.append(r)
-                    continue
-                good_images.append((ext, img_data["image"]))
-
-            for ext, data in good_images:
-                img_dir.mkdir(exist_ok=True)
-                img_count += 1
-                (img_dir / f"page{page_idx + 1}_{img_count}.{ext}").write_bytes(data)
-
-            if not good_images:
-                captions = _find_figure_captions(page)
-                for cap_rect in captions:
-                    hints: list = list(deco_rects)
-                    for d in page.get_drawings():
-                        dr = fitz.Rect(d["rect"])
-                        if dr.y0 < cap_rect.y0 + 10:
-                            hints.append(dr)
-                    if not hints:
-                        continue
-                    hint_union = hints[0]
-                    for r in hints[1:]:
-                        hint_union = hint_union | r
-                    try:
-                        pix = _crop_figure_region(page, cap_rect, hint_union)
-                        img_dir.mkdir(exist_ok=True)
-                        img_count += 1
-                        fig_path = img_dir / f"page{page_idx + 1}_{img_count}_fig.png"
-                        pix.save(str(fig_path))
-                        _trim_whitespace(fig_path)
-                    except Exception:
-                        pass
-        doc.close()
-        text = "\n\n".join(pages).strip()
+        md_text = pymupdf4llm.to_markdown(
+            str(pdf_path),
+            write_images=True,
+            image_path=str(img_dir),
+            image_format="png",
+            image_size_limit=0,
+            show_progress=False,
+        )
+        md_text = md_text.replace(str(img_dir) + "/", "images/")
+        md_text = _filter_formula_images(img_dir, md_text)
     except PdfExtractionError:
         raise
     except Exception as e:
         raise PdfExtractionError(f"Failed to read PDF: {e}")
-    if len(text) < 200:
-        raise PdfExtractionError(f"Extracted text too short ({len(text)} chars), likely a scanned PDF")
-    return text
+    if len(md_text) < 200:
+        raise PdfExtractionError(f"Extracted text too short ({len(md_text)} chars), likely a scanned PDF")
+    return md_text
 
 
 def extract_archive(archive_path: Path, out_dir: Path) -> None:
@@ -618,7 +530,7 @@ def extract_archive(archive_path: Path, out_dir: Path) -> None:
     elif data[:4] == b"%PDF":
         shutil.copy2(archive_path, out_dir / "paper.pdf")
         text = _pdf_to_text(out_dir / "paper.pdf", out_dir)
-        (out_dir / "paper.txt").write_text(text, encoding="utf-8")
+        (out_dir / "paper.md").write_text(text, encoding="utf-8")
     elif b"\\documentclass" in data[:4096] or b"\\begin{" in data[:4096]:
         (out_dir / "main.tex").write_bytes(data)
     else:
@@ -747,6 +659,41 @@ def launch_agent_in_folder(
     return out_file.read_text(encoding="utf-8").strip()
 
 
+def run_local_summarize(
+    name: str,
+    data_dir: Path | None = None,
+    mode: str = "claude",
+    progress_callback: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Summarize a paper already present in data/<name>/ with a .pdf file.
+    Converts the PDF to markdown, then launches the chosen agent.
+    """
+    data_dir = data_dir or DATA_DIR
+    paper_dir = data_dir / name
+    if not paper_dir.is_dir():
+        raise FileNotFoundError(f"Directory not found: {paper_dir}")
+
+    pdfs = [f for f in paper_dir.iterdir() if f.suffix.lower() == ".pdf" and f.is_file()]
+    if not pdfs:
+        raise FileNotFoundError(f"No PDF file found in {paper_dir}")
+    pdf_path = pdfs[0]
+
+    _emit_progress(progress_callback, f"正在转换 PDF：{pdf_path.name}")
+    md_path = paper_dir / "paper.md"
+    text = _pdf_to_text(pdf_path, paper_dir)
+    md_path.write_text(text, encoding="utf-8")
+
+    _convert_figure_pdfs(paper_dir)
+    if _dir_size(paper_dir) > _MAX_DIR_BYTES:
+        _trim_paper_dir(paper_dir)
+
+    _emit_progress(progress_callback, f"论文文件已准备完成：{paper_dir.name}")
+    if mode == "cursor":
+        return launch_agent_in_folder(paper_dir, SUMMARY_PROMPT, progress_callback=progress_callback)
+    return launch_claude_in_folder(paper_dir, SUMMARY_PROMPT)
+
+
 def run_summarize(
     arxiv_id: str,
     data_dir: Path | None = None,
@@ -791,7 +738,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download arXiv TeX source, launch Claude or Cursor agent in that folder to summarize."
     )
-    parser.add_argument("url", help="arXiv URL (e.g. https://arxiv.org/abs/2301.12345)")
+    parser.add_argument("input", help="arXiv URL, arXiv id, or local folder name in data/ (e.g. deepseekV4)")
     parser.add_argument(
         "--mode",
         choices=("claude", "cursor"),
@@ -800,9 +747,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    arxiv_id = arxiv_id_from_url(args.url)
+    local_dir = DATA_DIR / args.input
+    if local_dir.is_dir():
+        print(f"Using local paper directory: {local_dir}")
+        summary = run_local_summarize(args.input, mode=args.mode)
+        print("Summary (saved to summarize.md):")
+        print(summary)
+        return
+
+    arxiv_id = arxiv_id_from_url(args.input) or args.input.strip()
     if not arxiv_id:
-        print("ERROR: Could not parse arXiv id from URL.", file=sys.stderr)
+        print("ERROR: Could not parse arXiv id from input.", file=sys.stderr)
         sys.exit(1)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)

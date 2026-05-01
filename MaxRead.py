@@ -40,7 +40,7 @@ from lark_oapi.api.contact.v3 import GetUserRequest
 
 from feishu.config import get_config
 from feishu.resilient import call_api
-from reader.arxiv_summarize import ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids, run_summarize
+from reader.arxiv_summarize import ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids, run_summarize, run_local_summarize
 from transform.feishu_doc import create_summary_doc, doc_url
 
 logging.basicConfig(
@@ -224,6 +224,43 @@ def _enqueue_arxiv_job(
     _queue_event.set()
 
 
+def _enqueue_pdf_job(
+    message_id: str,
+    tenant_key: str,
+    file_key: str,
+    file_name: str,
+    *,
+    sender_open_id: str | None = None,
+    sender_name: str | None = None,
+) -> None:
+    job_key = _job_key(message_id, file_key)
+    pending_path = _pending_job_path(job_key)
+    running_path = _running_job_path(job_key)
+    payload = {
+        "job_type": "pdf",
+        "message_id": message_id,
+        "tenant_key": tenant_key,
+        "file_key": file_key,
+        "file_name": file_name,
+        "staged_reactions": True,
+        "sender_open_id": sender_open_id,
+        "sender_name": sender_name,
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _queue_lock:
+        if pending_path.exists() or running_path.exists():
+            logger.info("Queue job already exists for message %s file %s", message_id, file_key)
+            return
+        _write_json_file(pending_path, payload)
+    _queue_event.set()
+
+
+def _job_label(job: dict) -> str:
+    if job.get("job_type") == "pdf":
+        return str(job.get("file_name") or "PDF")
+    return f"arXiv {job.get('arxiv_id', 'unknown')}"
+
+
 def _queue_worker() -> None:
     while True:
         claimed = _claim_next_job()
@@ -235,50 +272,58 @@ def _queue_worker() -> None:
         running_path, job = claimed
         group_message_id = str(job.get("group_message_id") or "").strip() or None
         preserve_running_job = False
+        label = _job_label(job)
         try:
-            _process_one_arxiv_for_message(
-                str(job["message_id"]),
-                str(job["tenant_key"]),
-                str(job["arxiv_id"]),
-                staged_reactions=bool(job.get("staged_reactions")),
-                sender_open_id=job.get("sender_open_id"),
-                sender_name=job.get("sender_name"),
-            )
+            if job.get("job_type") == "pdf":
+                _process_one_pdf_for_message(
+                    str(job["message_id"]),
+                    str(job["tenant_key"]),
+                    str(job["file_key"]),
+                    str(job.get("file_name", "")),
+                    staged_reactions=bool(job.get("staged_reactions")),
+                    sender_open_id=job.get("sender_open_id"),
+                    sender_name=job.get("sender_name"),
+                )
+            else:
+                _process_one_arxiv_for_message(
+                    str(job["message_id"]),
+                    str(job["tenant_key"]),
+                    str(job["arxiv_id"]),
+                    staged_reactions=bool(job.get("staged_reactions")),
+                    sender_open_id=job.get("sender_open_id"),
+                    sender_name=job.get("sender_name"),
+                )
         except RestartRequestedError:
             logger.warning(
-                "Requeueing job at end before restart: message=%s arXiv=%s",
-                job.get("message_id"),
-                job.get("arxiv_id"),
+                "Requeueing job at end before restart: message=%s %s",
+                job.get("message_id"), label,
             )
             _requeue_job_at_end(running_path, job, note="Claude CLI crash restart")
             preserve_running_job = True
         except subprocess.TimeoutExpired as e:
-            arxiv_id = str(job.get("arxiv_id", "unknown"))
             message_id = str(job.get("message_id", ""))
-            logger.error("Claude CLI timed out for arXiv %s, giving up", arxiv_id)
-            # Save the prompt to a .txt so it can be re-run manually
+            logger.error("Claude CLI timed out for %s, giving up", label)
             errors_dir = ROOT / "errors"
             errors_dir.mkdir(parents=True, exist_ok=True)
-            prompt_file = errors_dir / f"timed_out_prompt_{arxiv_id.replace('/', '_')}.txt"
+            safe_label = label.replace("/", "_").replace(" ", "_")
+            prompt_file = errors_dir / f"timed_out_prompt_{safe_label}.txt"
             prompt_content = " ".join(str(a) for a in (e.cmd or [])) if e.cmd else str(e)
             prompt_file.write_text(prompt_content, encoding="utf-8")
             logger.info("Saved timed-out prompt to %s", prompt_file)
             if message_id:
-                _reply_to_message(message_id, f"哥，网又寄了，要不待会再试（arXiv {arxiv_id} 超时了）")
-            # Don't requeue — let it complete and be removed
+                _reply_to_message(message_id, f"哥，网又寄了，要不待会再试（{label} 超时了）")
         except Exception as e:
             logger.exception("Queue worker failed for %s: %s", running_path.name, e)
             retry_count = int(job.get("retry_count") or 0)
-            arxiv_id = str(job.get("arxiv_id", "unknown"))
             message_id = str(job.get("message_id", ""))
             if retry_count >= _MAX_JOB_RETRIES:
-                logger.error("Job exceeded max retries (%d): arXiv %s", _MAX_JOB_RETRIES, arxiv_id)
+                logger.error("Job exceeded max retries (%d): %s", _MAX_JOB_RETRIES, label)
                 if message_id:
-                    _reply_to_message(message_id, f"哥，试了 {retry_count} 次还是不行，先放弃了（arXiv {arxiv_id}）")
+                    _reply_to_message(message_id, f"哥，试了 {retry_count} 次还是不行，先放弃了（{label}）")
             else:
                 logger.warning(
-                    "Requeueing failed job at end (retry %d/%d): message=%s arXiv=%s",
-                    retry_count + 1, _MAX_JOB_RETRIES, job.get("message_id"), arxiv_id,
+                    "Requeueing failed job at end (retry %d/%d): message=%s %s",
+                    retry_count + 1, _MAX_JOB_RETRIES, job.get("message_id"), label,
                 )
                 _requeue_job_at_end(running_path, job, note=f"Job failed: {type(e).__name__}")
                 preserve_running_job = True
@@ -400,6 +445,29 @@ def _add_reaction(message_id: str, emoji_type: str) -> str | None:
     except Exception as e:
         logger.warning("Failed to add reaction for %s: %s", message_id, e)
     return None
+
+
+def _download_feishu_file(message_id: str, file_key: str) -> bytes:
+    """Download a file attachment from a Feishu message."""
+    from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+    req = (
+        GetMessageResourceRequest.builder()
+        .message_id(message_id)
+        .file_key(file_key)
+        .type("file")
+        .build()
+    )
+    resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message_resource.get, req)
+    if not resp or getattr(resp, "code", -1) != 0:
+        raise IOError(
+            f"Failed to download file {file_key}: "
+            f"code={getattr(resp, 'code', None)}, msg={getattr(resp, 'msg', None)}"
+        )
+    f = getattr(resp, "file", None)
+    if f is None:
+        raise IOError(f"No file content in response for {file_key}")
+    return f.read()
 
 
 def _remove_reaction(message_id: str, reaction_id: str | None) -> None:
@@ -637,8 +705,109 @@ def _process_one_arxiv_for_message(
         if staged_reactions and reaction_id:
             _remove_reaction(message_id, reaction_id)
 
+
+def _process_one_pdf_for_message(
+    message_id: str,
+    tenant_key: str,
+    file_key: str,
+    file_name: str,
+    *,
+    staged_reactions: bool,
+    sender_open_id: str | None = None,
+    sender_name: str | None = None,
+) -> None:
+    """Download a PDF from Feishu, summarize it, and reply with a doc link."""
+    logger.info("PDF %s for message %s", file_name, message_id)
+    reaction_id: str | None = None
+    paper_id: str | None = None
+
+    if staged_reactions:
+        reaction_id = _add_reaction(message_id, "Get")
+
+    try:
+        logger.info("Downloading PDF %s from Feishu...", file_name)
+        file_bytes = _download_feishu_file(message_id, file_key)
+
+        file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
+        paper_id = file_hash
+
+        _save_query_log(paper_id, sender_open_id, sender_name)
+
+        existing_doc_link = _load_saved_doc_link(paper_id)
+        if existing_doc_link:
+            logger.info("Reusing saved Feishu doc link for PDF %s", paper_id)
+            _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+            _save_reply_time(paper_id, "reused")
+            if staged_reactions and reaction_id:
+                _remove_reaction(message_id, reaction_id)
+                reaction_id = None
+            return
+
+        paper_dir = _paper_dir_for_arxiv(paper_id)
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        (paper_dir / "paper.pdf").write_bytes(file_bytes)
+
+        def on_progress(msg: str) -> None:
+            nonlocal reaction_id
+            msg = msg.strip()
+            if not msg:
+                return
+            logger.info("[%s] %s", paper_id, msg)
+            if not staged_reactions:
+                return
+            if msg.startswith("论文文件已准备完成"):
+                _remove_reaction(message_id, reaction_id)
+                reaction_id = _add_reaction(message_id, "OnIt")
+
+        summary = run_local_summarize(
+            paper_id,
+            data_dir=ROOT / "reader" / "data",
+            mode="claude",
+            progress_callback=on_progress,
+        )
+
+        if staged_reactions:
+            _remove_reaction(message_id, reaction_id)
+            reaction_id = _add_reaction(message_id, "Typing")
+
+        title_base = Path(file_name).stem if file_name else paper_id
+        title = f"{title_base} 摘要"
+        lines = summary.split("\n", 1)
+        summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格 和 图文对应可能不准）" + ("\n" + lines[1] if len(lines) > 1 else "")
+
+        doc_id = None
+        if _feishu_client:
+            doc_id = create_summary_doc(
+                _feishu_client, title, summary, base_dir=paper_dir,
+                api_lock=_feishu_api_lock,
+            )
+        if doc_id:
+            document_link = doc_url(doc_id, tenant_key)
+            _save_doc_link(paper_id, doc_id, document_link, tenant_key)
+            _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
+            _save_reply_time(paper_id, "success")
+        else:
+            _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（{file_name}）")
+            _save_reply_time(paper_id, "success_no_link")
+    except PdfExtractionError as e:
+        logger.warning("PDF extraction failed for %s: %s", file_name, e)
+        _reply_to_message(message_id, f"哥，这个PDF文字提取失败了（{file_name}）")
+        if paper_id:
+            _save_reply_time(paper_id, "pdf_extraction_failed")
+        return
+    except Exception as e:
+        logger.exception("PDF processing failed for %s: %s", file_name, e)
+        if _should_restart_for_exception(e):
+            _schedule_process_restart(f"Claude CLI crash while handling PDF {file_name}")
+            raise RestartRequestedError(f"Restart requested for PDF {file_name}") from e
+        raise
+    finally:
+        if staged_reactions and reaction_id:
+            _remove_reaction(message_id, reaction_id)
+
+
 def _on_message(data: P2ImMessageReceiveV1) -> None:
-    """On Feishu message: if it contains an arXiv link, summarize and reply (work runs in background)."""
+    """On Feishu message: if it contains an arXiv link or a PDF file, summarize and reply (work runs in background)."""
     try:
         event = data.event
         message = event.message
@@ -648,6 +817,42 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         content = message.content
         if not content:
             return
+
+        tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
+        assert tenant_key, "tenant_key should not be empty"
+
+        sender = getattr(event, "sender", None)
+        sender_id_obj = getattr(sender, "sender_id", None) if sender else None
+        sender_open_id = getattr(sender_id_obj, "open_id", None) if sender_id_obj else None
+
+        msg_type = getattr(message, "message_type", None) or ""
+
+        # ---- PDF file messages ----
+        if msg_type == "file":
+            try:
+                payload = json.loads(content)
+                file_key = payload.get("file_key", "")
+                file_name = payload.get("file_name", "")
+            except Exception:
+                return
+            if not file_key or not file_name.lower().endswith(".pdf"):
+                return
+
+            with _dedup_lock:
+                if message_id in _processed_message_ids:
+                    return
+                if len(_processed_message_ids) >= _MAX_PROCESSED_IDS:
+                    _processed_message_ids.clear()
+                _processed_message_ids.add(message_id)
+
+            sender_name = _fetch_user_name(sender_open_id) if sender_open_id else None
+            _enqueue_pdf_job(
+                message_id, tenant_key, file_key, file_name,
+                sender_open_id=sender_open_id, sender_name=sender_name,
+            )
+            return
+
+        # ---- Text / rich-text messages (arXiv links) ----
         try:
             payload = json.loads(content)
             text = (payload.get("text") or "").strip()
@@ -667,13 +872,6 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         if not text:
             return
 
-        tenant_key = getattr(getattr(data, "header", None), "tenant_key", None) or None
-        assert tenant_key, "tenant_key should not be empty"
-
-        # Extract sender info
-        sender = getattr(event, "sender", None)
-        sender_id_obj = getattr(sender, "sender_id", None) if sender else None
-        sender_open_id = getattr(sender_id_obj, "open_id", None) if sender_id_obj else None
         sender_name = _fetch_user_name(sender_open_id) if sender_open_id else None
 
         ids = extract_arxiv_ids(text)
