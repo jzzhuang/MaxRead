@@ -1,78 +1,69 @@
 # MaxRead
 
-Utilities for summarizing papers and transforming markdown summaries into Feishu Docs, plus a Feishu long-connection bot listener.
+arXiv 论文 & PDF 自动精读 → 飞书云文档。
 
-## Install
+## 用法
 
-Run from project root:
+在飞书里给 bot 发消息，支持两种输入：
 
-```bash
-pip install -r requirements.txt
+| 输入 | 示例 |
+|---|---|
+| arXiv 链接或 ID | `https://arxiv.org/abs/2301.12345`、`2301.12345` |
+| PDF 文件 | 直接上传 `.pdf` 文件 |
+
+一条消息可以包含多个 arXiv ID，每篇单独处理、单独回复。
+
+## 处理流程
+
+1. 收到消息，回复 emoji 表示进度（`Get` → `OnIt` → `Typing`）
+2. 下载论文源码 / 提取 PDF 文字
+3. Claude 生成中文精读笔记（方法、公式、实验、消融、图表逐一解读）
+4. 转为飞书云文档（支持标题、公式、表格、图片、代码块）
+5. 回复文档链接
+
+## 输出
+
+回复格式为飞书云文档链接，文档内容是面向中文 ML 从业者的深度阅读笔记，不是翻译。
+
+## 注意事项
+
+- 仅响应 arXiv 链接/ID 和 PDF 文件，其他消息静默忽略
+- 同一篇论文有缓存，重复发送直接返回已有文档
+- PDF-only 论文（无 TeX 源码）会标注"表格和图文对应可能不准"
+- 最多 8 个任务并行，超出自动排队
+- 单篇最多重试 5 次
+
+## 配置
+
+飞书凭证放在 `feishu/.env`：
+
+```
+FEISHU_APP_ID=xxx
+FEISHU_APP_SECRET=xxx
 ```
 
-## Quick Start
+运行：
 
 ```bash
-python -m transform reader/data/2512.16248/summarize.md --feishu --tenant vrfi1sk8a0
+python3 MaxRead.py
 ```
 
-## Transform
+## Transform 模块
 
-Markdown -> Feishu docx transformation: parse `.md` into block types (headings, text, equations, bold/italic, bullet/ordered lists, tables) and optionally create Feishu cloud docs.
+Markdown → Feishu docx 转换：解析 `.md` 为 block（标题、文本、公式、列表、表格、图片、代码块），调 Feishu API 创建云文档。
 
-### Layout
+公式经过 KaTeX 本地验证，结构性错误（未闭合花括号、参数缺失等）会记录 warning；角括号 `<`/`>` 自动转义避免被飞书 HTML 解析器吞掉。
 
-- `transform/constants.py` - Feishu docx block type IDs (text, heading1-3, equation, bullet, ordered, table, code)
-- `transform/inline.py` - `parse_inline(text)` for styled text runs
-- `transform/parser.py` - `parse_md_to_blocks(md)` returning parsed blocks
-- `transform/feishu_doc.py` - `create_summary_doc()`, `doc_url()` (Feishu API integration)
-
-### Module Testing (CLI)
+CLI 测试：
 
 ```bash
-# Local: parse a fixed .md file, write blocks to JSON, print output path
+# 本地解析，输出 JSON
 python -m transform path/to/summarize.md
-# -> prints e.g. /home/tianze/MaxRead/transform_out/summarize_blocks.json
 
-python -m transform --md path/to/summarize.md --out-dir ./out
-
-# With Feishu: create cloud doc and print doc URL
+# 创建飞书云文档
 python -m transform --md path/to/summarize.md --feishu --title "My Summary"
-# -> prints e.g. https://open.feishu.cn/docx/xxx
 ```
 
-Output in local mode: one JSON file per run under `--out-dir` (default `transform_out/`), with `block_type` names and `content` for each block.
+## 日志
 
-## Feishu Long Connection (Bot Listener)
-
-Use Feishu Open Platform long connection to receive events and print messages in terminal without replying.
-
-### 配置
-
-1. 在 [飞书开放平台](https://open.feishu.cn/app) 创建应用，在 **凭证与基础信息** 中复制 **App ID**、**App Secret**。
-2. **事件与回调 -> 事件配置**：选择「**使用长连接接收事件**」，添加事件 `im.message.receive_v1`。
-3. **版本管理与发布**：创建版本并发布（未发布则无法检测到连接）。
-4. **权限**：开通 `im:message`、`im:message:send_as_bot`、`im:message.p2p_msg` 并订阅「接收消息」。
-
-### 安装与运行
-
-```bash
-cp feishu/.env.example feishu/.env
-# 编辑 .env 填写 FEISHU_APP_ID、FEISHU_APP_SECRET；
-# 若控制台配置了验证/加密则填 FEISHU_VERIFICATION_TOKEN、FEISHU_ENCRYPT_KEY
-# 建议设置 CLAUDE_CLI_PATH（例如 /home/<user>/.local/bin/claude），
-# 这样在新终端/新会话里也能稳定找到 Claude CLI
-```
-
-在项目根目录运行：
-
-```bash
-python -m feishu.bot_ws
-```
-
-连接成功后，在开放平台保存事件配置。之后给机器人发消息，终端会打印 `RECEIVED` 及消息内容。
-
-### 其他
-
-- 发消息：`python -m feishu.send_message "你好"`
-- 代码中调用 API：`from feishu.bot import get_client`，用 `get_client()` 获取 Lark 客户端。
+运行日志写入 `maxread.log`（10MB 滚动，保留 3 份备份），同时输出到 console。

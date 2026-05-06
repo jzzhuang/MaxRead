@@ -16,6 +16,7 @@ import json
 import hashlib
 import logging
 import logging.handlers
+import re
 import os
 import subprocess
 import sys
@@ -29,7 +30,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.application.v6 import P2ApplicationBotMenuV6
 from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
 from lark_oapi.api.im.v1.model.create_message_reaction_request_body import CreateMessageReactionRequestBody
 from lark_oapi.api.im.v1.model.delete_message_reaction_request import DeleteMessageReactionRequest
@@ -511,6 +513,120 @@ def _remove_reaction(message_id: str, reaction_id: str | None) -> None:
         logger.warning("Failed to remove reaction for %s: %s", message_id, e)
 
 
+def _send_message(open_id: str, text: str) -> None:
+    """Send a direct message to a user by open_id."""
+    if not _feishu_client:
+        logger.error("Feishu HTTP client not initialized")
+        return
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(open_id)
+        .content(json.dumps({"text": text}))
+        .msg_type("text")
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type("open_id")
+        .request_body(body)
+        .build()
+    )
+    try:
+        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message.create, req)
+        if resp and getattr(resp, "code", 0) != 0:
+            logger.warning("Send message API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
+        else:
+            logger.info("Sent message to %s", open_id)
+    except Exception as e:
+        logger.exception("Failed to send message: %s", e)
+
+
+def _send_card_message(open_id: str, card: dict) -> None:
+    """Send an interactive card message to a user by open_id."""
+    if not _feishu_client:
+        logger.error("Feishu HTTP client not initialized")
+        return
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(open_id)
+        .content(json.dumps(card))
+        .msg_type("interactive")
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type("open_id")
+        .request_body(body)
+        .build()
+    )
+    try:
+        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message.create, req)
+        if resp and getattr(resp, "code", 0) != 0:
+            logger.warning("Send card API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
+        else:
+            logger.info("Sent card to %s", open_id)
+    except Exception as e:
+        logger.exception("Failed to send card: %s", e)
+
+
+def _build_help_card(md_text: str) -> dict:
+    """Parse help.md content into a Feishu interactive card."""
+    _EMOJI_MAP = {"[了解]": ":Get:", "[在做了]": ":OnIt:", "[敲键盘]": ":Typing:"}
+    for bracket, colon in _EMOJI_MAP.items():
+        md_text = md_text.replace(bracket, colon)
+
+    # Split by ━━━ section dividers
+    parts = re.split(r"━━━\s*(.*?)\s*━━━", md_text.strip())
+
+    elements = []
+
+    # parts[0] = intro (before first divider)
+    intro = parts[0].strip()
+    if intro:
+        elements.append({"tag": "markdown", "content": intro})
+
+    # Remaining parts come in (title, content) pairs
+    for i in range(1, len(parts), 2):
+        title = parts[i].strip()
+        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        elements.append({"tag": "hr"})
+        section_md = f"**{title}**\n\n{body}" if body else f"**{title}**"
+        elements.append({"tag": "markdown", "content": section_md})
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "📖 读不动了 — 使用帮助"},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+
+
+def _on_bot_menu(data: P2ApplicationBotMenuV6) -> None:
+    """Handle bot custom menu events."""
+    try:
+        event = data.event
+        event_key = getattr(event, "event_key", None) or ""
+        operator = getattr(event, "operator", None)
+        operator_id = getattr(operator, "operator_id", None) if operator else None
+        open_id = getattr(operator_id, "open_id", None) if operator_id else None
+
+        user_name = _fetch_user_name(open_id) if open_id else None
+        logger.info("Bot menu event: event_key=%s open_id=%s name=%s", event_key, open_id, user_name)
+
+        if event_key == "Action: help" and open_id:
+            _help_file = ROOT / "help.md"
+            try:
+                _help_text = _help_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                _help_text = "帮助文件不存在，请联系管理员。"
+            card = _build_help_card(_help_text)
+            _send_card_message(open_id, card)
+    except Exception as e:
+        logger.exception("Bot menu handler error: %s", e)
+
+
 def _noop(_) -> None:
     """Ignore unsupported event types (e.g. bot_p2p_chat_entered_v1, message_read_v1)."""
     pass
@@ -939,6 +1055,7 @@ def main() -> None:
     handler = (
         lark.EventDispatcherHandler.builder(encrypt_key, token, lark.LogLevel.INFO)
         .register_p2_im_message_receive_v1(_on_message)
+        .register_p2_application_bot_menu_v6(_on_bot_menu)
         .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_noop)
         .register_p2_im_message_message_read_v1(_noop)
         .build()

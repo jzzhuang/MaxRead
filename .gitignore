@@ -13,3 +13,4 @@ paper_ids.txt
 *.png
 
 node_modules/
+maxread.log
