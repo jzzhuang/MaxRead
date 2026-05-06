@@ -15,6 +15,7 @@ Requires: FEISHU_APP_ID, FEISHU_APP_SECRET in feishu/.env;
 import json
 import hashlib
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -43,10 +44,26 @@ from feishu.resilient import call_api
 from reader.arxiv_summarize import ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids, run_summarize, run_local_summarize
 from transform.feishu_doc import create_summary_doc, doc_url
 
+_LOG_FILE = ROOT / "maxread.log"
+_log_fmt = logging.Formatter(
+    "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+))
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    _LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+_file_handler.setFormatter(_log_fmt)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
+    handlers=[_console, _file_handler],
 )
 logger = logging.getLogger("MaxRead")
 

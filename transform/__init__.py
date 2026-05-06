@@ -16,6 +16,7 @@ from .constants import (
 from .parser import parse_md_to_blocks
 from .inline import parse_inline
 from .feishu_doc import create_summary_doc, doc_url
+from .katex_validate import validate_markdown
 
 __all__ = [
     "DOCX_BLOCK_TYPE_TEXT",
@@ -32,4 +33,5 @@ __all__ = [
     "parse_inline",
     "create_summary_doc",
     "doc_url",
+    "validate_markdown",
 ]

@@ -51,6 +51,7 @@ from .constants import (
     DOCX_BLOCK_TYPE_IMAGE,
     DOCX_BLOCK_TYPE_GRID,
 )
+from .katex_validate import validate_markdown
 
 from feishu.resilient import call_api
 
@@ -349,6 +350,20 @@ def _insert_markdown_chunk(
         for chunk in sub_chunks:
             total += _insert_markdown_chunk(client, document_id, index + total, chunk, api_lock)
         return total
+
+    # ── KaTeX structural validation ──────────────────────────────
+    # Run the real KaTeX parser to catch genuinely broken formulas
+    # (unmatched braces, bad \frac args, etc.).  The angle-bracket
+    # escape below is Feishu-specific and stays regardless.
+    math_errors = validate_markdown(markdown)
+    for err in math_errors:
+        kind = "display" if err["display"] else "inline"
+        logger.warning(
+            "KaTeX validation error (%s math): %s\n  LaTeX: %s",
+            kind,
+            err["error"],
+            err["latex"][:120],
+        )
 
     markdown = _escape_math_angle_brackets(markdown)
 
