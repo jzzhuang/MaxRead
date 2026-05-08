@@ -306,8 +306,8 @@ def _split_large_table(markdown: str) -> list[str]:
     return chunks if chunks else [markdown]
 
 
-_DISPLAY_MATH_RE = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
-_INLINE_MATH_RE = re.compile(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)')
+_DISPLAY_MATH_RE = re.compile(r'(?<!\\)\$\$(.+?)(?<!\\)\$\$', re.DOTALL)
+_INLINE_MATH_RE = re.compile(r'(?<![\$\\])\$(?!\$)(.+?)(?<![\$\\])\$(?!\$)')
 
 
 def _escape_math_angle_brackets(markdown: str) -> str:

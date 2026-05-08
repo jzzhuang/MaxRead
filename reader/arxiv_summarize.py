@@ -41,6 +41,7 @@ _JUNK_SUFFIXES = frozenset({
     ".sty", ".cls", ".bst", ".def",
     ".ttf", ".otf", ".pfb", ".tfm", ".vf", ".fd", ".mf",
     ".eps", ".ps",
+    ".bib",
 })
 _IMAGE_SUFFIXES = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".tiff", ".bmp", ".svg",
@@ -179,9 +180,26 @@ def _trim_paper_dir(paper_dir: Path, max_bytes: int = _MAX_DIR_BYTES) -> None:
         if f.is_file() and f.suffix.lower() in _JUNK_SUFFIXES:
             f.unlink()
 
+    converted_pdfs = []
     for f in list(paper_dir.rglob("*.pdf")):
         if f.is_file():
+            old_name = f.name
             _convert_pdf_to_png(f)
+            if not f.exists():
+                converted_pdfs.append(old_name)
+
+    if converted_pdfs:
+        for tex in paper_dir.rglob("*.tex"):
+            try:
+                text = tex.read_text(encoding="utf-8", errors="replace")
+                updated = text
+                for old_name in converted_pdfs:
+                    new_name = old_name.rsplit(".", 1)[0] + ".png"
+                    updated = updated.replace(old_name, new_name)
+                if updated != text:
+                    tex.write_text(updated, encoding="utf-8")
+            except Exception:
+                pass
 
     for f in paper_dir.rglob("*"):
         if (

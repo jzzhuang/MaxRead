@@ -21,8 +21,8 @@ _SCRIPT = Path(__file__).with_name("validate_katex.js")
 _NODE = "node"
 
 # Same regexes used by the rest of the pipeline.
-_DISPLAY_MATH_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
-_INLINE_MATH_RE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)")
+_DISPLAY_MATH_RE = re.compile(r"(?<!\\)\$\$(.+?)(?<!\\)\$\$", re.DOTALL)
+_INLINE_MATH_RE = re.compile(r"(?<![\$\\])\$(?!\$)(.+?)(?<![\$\\])\$(?!\$)")
 
 
 def extract_math(markdown: str) -> list[dict]:

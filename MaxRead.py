@@ -803,7 +803,7 @@ def _process_one_arxiv_for_message(
         is_txt_converted = (paper_dir / "paper.txt").is_file()
         if is_pdf_source and is_txt_converted:
             lines = summary.split("\n", 1)
-            summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格 和 图文对应可能不准）" + ("\n" + lines[1] if len(lines) > 1 else "")
+            summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格和图文对应可能不准，推荐试试发送arxiv链接）" + ("\n" + lines[1] if len(lines) > 1 else "")
         doc_id = None
         if _feishu_client:
             doc_id = create_summary_doc(
@@ -906,7 +906,7 @@ def _process_one_pdf_for_message(
         title_base = Path(file_name).stem if file_name else paper_id
         title = f"{title_base} 摘要"
         lines = summary.split("\n", 1)
-        summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格 和 图文对应可能不准）" + ("\n" + lines[1] if len(lines) > 1 else "")
+        summary = lines[0] + "\n\n（该文章通过PDF转换为文字，表格和图文对应可能不准，推荐试试发送arxiv链接）" + ("\n" + lines[1] if len(lines) > 1 else "")
 
         doc_id = None
         if _feishu_client:
