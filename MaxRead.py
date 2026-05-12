@@ -12,17 +12,14 @@ a message with multiple arXiv ids processes them with at most two jobs at a time
 Requires: FEISHU_APP_ID, FEISHU_APP_SECRET in feishu/.env;
   CURSOR_API_KEY in env or cursor_api_key.txt at repo root.
 """
-import json
 import hashlib
+import json
 import logging
 import logging.handlers
-import re
 import os
-import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # Project root
@@ -30,22 +27,25 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from lark_oapi.api.application.v6 import P2ApplicationBotMenuV6
-from lark_oapi.api.im.v1.model.create_message_reaction_request import CreateMessageReactionRequest
-from lark_oapi.api.im.v1.model.create_message_reaction_request_body import CreateMessageReactionRequestBody
-from lark_oapi.api.im.v1.model.delete_message_reaction_request import DeleteMessageReactionRequest
-from lark_oapi.api.im.v1.model.emoji import Emoji
-from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
-from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
-
-from lark_oapi.api.contact.v3 import GetUserRequest
 
 from feishu.config import get_config
-from feishu.resilient import call_api
-from reader.arxiv_summarize import ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids, run_summarize, run_local_summarize
+import feishu.messaging as messaging
+import metadata
+import job_queue
+import illustration
+from job_queue import RestartRequestedError
+
+from reader.arxiv_summarize import (
+    ArxivNotFoundError, PdfExtractionError, extract_arxiv_ids,
+    prepare_paper_dir, summarize_prepared_dir, launch_claude_for_illustration,
+)
 from transform.feishu_doc import create_summary_doc, doc_url
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 _LOG_FILE = ROOT / "maxread.log"
 _log_fmt = logging.Formatter(
     "%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -69,317 +69,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MaxRead")
 
-# HTTP client (built in main)
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
 _feishu_client = None
+_feishu_api_lock = threading.Lock()
 
 # Deduplicate by message_id (Feishu may deliver the same message event more than once)
 _MAX_PROCESSED_IDS = 5000
 _processed_message_ids: set[str] = set()
 _dedup_lock = threading.Lock()
-_DOC_LINK_METADATA_FILE = "doc_link.json"
 
-# Feishu HTTP client may not be thread-safe; serialize API calls.
-_feishu_api_lock = threading.Lock()
-
-# Background work so the WS handler returns immediately and new messages can be accepted.
-# At most 2 arXiv jobs run at once; additional work waits in a disk-backed queue so restart can resume them.
-_MAX_PARALLEL = 8
-_MAX_JOB_RETRIES = 5
 _RESTART_DELAY_SECONDS = 3
 _restart_lock = threading.Lock()
 _restart_scheduled = False
-_queue_lock = threading.Lock()
-_queue_event = threading.Event()
-_queue_workers_started = False
-_QUEUE_DIR = ROOT / ".maxread_queue"
-_QUEUE_PENDING_DIR = _QUEUE_DIR / "pending"
-_QUEUE_RUNNING_DIR = _QUEUE_DIR / "running"
-_QUEUE_GROUP_DIR = _QUEUE_DIR / "groups"
+_OWNER_OPEN_ID = "ou_fa85f3ecd5572996940d6f1185aa2a24"  # 天择 — only owner gets illustration
 
 
-class RestartRequestedError(RuntimeError):
-    """Raised when the current job should be retried after a process restart."""
-    pass
-
-
-def _write_json_file(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
-
-
-def _read_json_file(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _job_key(message_id: str, arxiv_id: str) -> str:
-    raw = f"{message_id}\0{arxiv_id}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()
-
-
-def _group_key(message_id: str) -> str:
-    return hashlib.sha1(message_id.encode("utf-8")).hexdigest()
-
-
-def _pending_job_path(job_key: str) -> Path:
-    return _QUEUE_PENDING_DIR / f"{job_key}.json"
-
-
-def _running_job_path(job_key: str) -> Path:
-    return _QUEUE_RUNNING_DIR / f"{job_key}.json"
-
-
-def _group_state_path(message_id: str) -> Path:
-    return _QUEUE_GROUP_DIR / f"{_group_key(message_id)}.json"
-
-
-def _recover_running_jobs() -> int:
-    recovered = 0
-    for running_path in sorted(_QUEUE_RUNNING_DIR.glob("*.json")):
-        payload = _read_json_file(running_path)
-        _requeue_job_at_end(running_path, payload, note="Recovered after restart")
-        recovered += 1
-    return recovered
-
-
-def _claim_next_job() -> tuple[Path, dict] | None:
-    with _queue_lock:
-        if _restart_scheduled:
-            return None
-        pending_paths = sorted(_QUEUE_PENDING_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        for pending_path in pending_paths:
-            running_path = _QUEUE_RUNNING_DIR / pending_path.name
-            try:
-                pending_path.replace(running_path)
-            except FileNotFoundError:
-                continue
-            return running_path, _read_json_file(running_path)
-    return None
-
-
-def _complete_job(running_path: Path) -> None:
-    try:
-        running_path.unlink(missing_ok=True)
-    except Exception as e:
-        logger.warning("Failed to remove completed queue job %s: %s", running_path.name, e)
-
-
-def _requeue_job_at_end(running_path: Path, payload: dict, *, note: str) -> None:
-    pending_path = _QUEUE_PENDING_DIR / running_path.name
-    updated_payload = dict(payload)
-    updated_payload["queued_at"] = datetime.now(timezone.utc).isoformat()
-    updated_payload["retry_count"] = int(updated_payload.get("retry_count") or 0) + 1
-    updated_payload["last_requeue_note"] = note
-    _write_json_file(pending_path, updated_payload)
-    running_path.unlink(missing_ok=True)
-    _queue_event.set()
-
-
-def _ensure_group_state(message_id: str, total_jobs: int, reaction_id: str | None) -> None:
-    path = _group_state_path(message_id)
-    with _queue_lock:
-        if path.exists():
-            return
-        _write_json_file(
-            path,
-            {
-                "message_id": message_id,
-                "remaining": total_jobs,
-                "reaction_id": reaction_id,
-            },
-        )
-
-
-def _mark_group_job_finished(message_id: str) -> None:
-    path = _group_state_path(message_id)
-    reaction_id: str | None = None
-    with _queue_lock:
-        if not path.exists():
-            return
-        payload = _read_json_file(path)
-        remaining = max(0, int(payload.get("remaining") or 0) - 1)
-        if remaining > 0:
-            payload["remaining"] = remaining
-            _write_json_file(path, payload)
-            return
-        reaction_id = str(payload.get("reaction_id") or "").strip() or None
-        path.unlink(missing_ok=True)
-    if reaction_id:
-        _remove_reaction(message_id, reaction_id)
-
-
-def _enqueue_arxiv_job(
-    message_id: str,
-    tenant_key: str,
-    arxiv_id: str,
-    *,
-    staged_reactions: bool,
-    group_message_id: str | None = None,
-    sender_open_id: str | None = None,
-    sender_name: str | None = None,
-) -> None:
-    job_key = _job_key(message_id, arxiv_id)
-    pending_path = _pending_job_path(job_key)
-    running_path = _running_job_path(job_key)
-    payload = {
-        "message_id": message_id,
-        "tenant_key": tenant_key,
-        "arxiv_id": arxiv_id,
-        "staged_reactions": staged_reactions,
-        "group_message_id": group_message_id,
-        "sender_open_id": sender_open_id,
-        "sender_name": sender_name,
-        "queued_at": datetime.now(timezone.utc).isoformat(),
-    }
-    with _queue_lock:
-        if pending_path.exists() or running_path.exists():
-            logger.info("Queue job already exists for message %s arXiv %s", message_id, arxiv_id)
-            return
-        _write_json_file(pending_path, payload)
-    _queue_event.set()
-
-
-def _enqueue_pdf_job(
-    message_id: str,
-    tenant_key: str,
-    file_key: str,
-    file_name: str,
-    *,
-    sender_open_id: str | None = None,
-    sender_name: str | None = None,
-) -> None:
-    job_key = _job_key(message_id, file_key)
-    pending_path = _pending_job_path(job_key)
-    running_path = _running_job_path(job_key)
-    payload = {
-        "job_type": "pdf",
-        "message_id": message_id,
-        "tenant_key": tenant_key,
-        "file_key": file_key,
-        "file_name": file_name,
-        "staged_reactions": True,
-        "sender_open_id": sender_open_id,
-        "sender_name": sender_name,
-        "queued_at": datetime.now(timezone.utc).isoformat(),
-    }
-    with _queue_lock:
-        if pending_path.exists() or running_path.exists():
-            logger.info("Queue job already exists for message %s file %s", message_id, file_key)
-            return
-        _write_json_file(pending_path, payload)
-    _queue_event.set()
-
-
-def _job_label(job: dict) -> str:
-    if job.get("job_type") == "pdf":
-        return str(job.get("file_name") or "PDF")
-    return f"arXiv {job.get('arxiv_id', 'unknown')}"
-
-
-def _queue_worker() -> None:
-    while True:
-        claimed = _claim_next_job()
-        if claimed is None:
-            _queue_event.clear()
-            _queue_event.wait(timeout=1.0)
-            continue
-
-        running_path, job = claimed
-        group_message_id = str(job.get("group_message_id") or "").strip() or None
-        preserve_running_job = False
-        label = _job_label(job)
-        try:
-            if job.get("job_type") == "pdf":
-                _process_one_pdf_for_message(
-                    str(job["message_id"]),
-                    str(job["tenant_key"]),
-                    str(job["file_key"]),
-                    str(job.get("file_name", "")),
-                    staged_reactions=bool(job.get("staged_reactions")),
-                    sender_open_id=job.get("sender_open_id"),
-                    sender_name=job.get("sender_name"),
-                )
-            else:
-                _process_one_arxiv_for_message(
-                    str(job["message_id"]),
-                    str(job["tenant_key"]),
-                    str(job["arxiv_id"]),
-                    staged_reactions=bool(job.get("staged_reactions")),
-                    sender_open_id=job.get("sender_open_id"),
-                    sender_name=job.get("sender_name"),
-                )
-        except RestartRequestedError:
-            logger.warning(
-                "Requeueing job at end before restart: message=%s %s",
-                job.get("message_id"), label,
-            )
-            _requeue_job_at_end(running_path, job, note="Claude CLI crash restart")
-            preserve_running_job = True
-        except subprocess.TimeoutExpired as e:
-            message_id = str(job.get("message_id", ""))
-            logger.error("Claude CLI timed out for %s, giving up", label)
-            errors_dir = ROOT / "errors"
-            errors_dir.mkdir(parents=True, exist_ok=True)
-            safe_label = label.replace("/", "_").replace(" ", "_")
-            prompt_file = errors_dir / f"timed_out_prompt_{safe_label}.txt"
-            prompt_content = " ".join(str(a) for a in (e.cmd or [])) if e.cmd else str(e)
-            prompt_file.write_text(prompt_content, encoding="utf-8")
-            logger.info("Saved timed-out prompt to %s", prompt_file)
-            if message_id:
-                _reply_to_message(message_id, f"哥，网又寄了，要不待会再试（{label} 超时了）")
-        except Exception as e:
-            logger.exception("Queue worker failed for %s: %s", running_path.name, e)
-            retry_count = int(job.get("retry_count") or 0)
-            message_id = str(job.get("message_id", ""))
-            if retry_count >= _MAX_JOB_RETRIES:
-                logger.error("Job exceeded max retries (%d): %s", _MAX_JOB_RETRIES, label)
-                if message_id:
-                    _reply_to_message(message_id, f"哥，试了 {retry_count} 次还是不行，先放弃了（{label}）")
-            else:
-                logger.warning(
-                    "Requeueing failed job at end (retry %d/%d): message=%s %s",
-                    retry_count + 1, _MAX_JOB_RETRIES, job.get("message_id"), label,
-                )
-                _requeue_job_at_end(running_path, job, note=f"Job failed: {type(e).__name__}")
-                preserve_running_job = True
-        finally:
-            if not preserve_running_job and running_path.exists():
-                _complete_job(running_path)
-            if group_message_id and not preserve_running_job:
-                _mark_group_job_finished(group_message_id)
-
-
-def _start_queue_workers() -> None:
-    global _queue_workers_started
-    with _queue_lock:
-        if _queue_workers_started:
-            return
-        _queue_workers_started = True
-    for index in range(_MAX_PARALLEL):
-        threading.Thread(
-            target=_queue_worker,
-            name=f"arxiv_queue_{index + 1}",
-            daemon=True,
-        ).start()
-
-
-def _initialize_queue() -> None:
-    for path in (_QUEUE_PENDING_DIR, _QUEUE_RUNNING_DIR, _QUEUE_GROUP_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-    recovered = _recover_running_jobs()
-    pending = len(list(_QUEUE_PENDING_DIR.glob("*.json")))
-    if recovered:
-        logger.warning("Recovered %s running arXiv job(s) back into the queue", recovered)
-    if pending:
-        logger.info("Queue has %s pending arXiv job(s) on startup", pending)
-        _queue_event.set()
-    _start_queue_workers()
-
-
+# ---------------------------------------------------------------------------
+# Process restart
+# ---------------------------------------------------------------------------
 def _should_restart_for_exception(exc: Exception) -> bool:
     """Restart only for the known Claude/Bun crash that a fresh process often clears."""
     text = str(exc).lower()
@@ -404,6 +113,7 @@ def _schedule_process_restart(reason: str) -> None:
             logger.info("Restart already scheduled; skipping duplicate request")
             return
         _restart_scheduled = True
+    job_queue.set_restart_scheduled(True)
     threading.Thread(
         target=_restart_process_after_delay,
         args=(reason,),
@@ -412,337 +122,42 @@ def _schedule_process_restart(reason: str) -> None:
     ).start()
 
 
-def _reply_to_message(message_id: str, text: str, *, reply_in_thread: bool = True) -> None:
-    """Send a text reply to the given message, defaulting to thread replies."""
-    if not _feishu_client:
-        logger.error("Feishu HTTP client not initialized")
-        return
-    body = (
-        ReplyMessageRequestBody.builder()
-        .content(json.dumps({"text": text}))
-        .msg_type("text")
-        .reply_in_thread(reply_in_thread)
-        .build()
-    )
-    req = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
-    try:
-        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message.reply, req)
-        if resp and getattr(resp, "code", 0) != 0:
-            logger.warning("Reply API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
-        else:
-            logger.info("Replied to %s", message_id)
-    except Exception as e:
-        logger.exception("Failed to reply: %s", e)
-
-
-def _add_reaction(message_id: str, emoji_type: str) -> str | None:
-    """Add a reaction of the given emoji type; returns the reaction_id."""
-    if not _feishu_client:
-        return None
-    try:
-        body = (
-            CreateMessageReactionRequestBody.builder()
-            .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
-            .build()
-        )
-        req = (
-            CreateMessageReactionRequest.builder()
-            .message_id(message_id)
-            .request_body(body)
-            .build()
-        )
-        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message_reaction.create, req)
-        if resp and getattr(resp, "code", 0) == 0:
-            reaction_id = getattr(getattr(resp, "data", None), "reaction_id", None)
-            logger.info("Added reaction %s to %s", emoji_type, message_id)
-            return reaction_id
-        logger.warning(
-            "Add reaction API code: %s msg: %s",
-            getattr(resp, "code", None),
-            getattr(resp, "msg", ""),
-        )
-    except Exception as e:
-        logger.warning("Failed to add reaction for %s: %s", message_id, e)
-    return None
-
-
-def _download_feishu_file(message_id: str, file_key: str) -> bytes:
-    """Download a file attachment from a Feishu message."""
-    from lark_oapi.api.im.v1 import GetMessageResourceRequest
-
-    req = (
-        GetMessageResourceRequest.builder()
-        .message_id(message_id)
-        .file_key(file_key)
-        .type("file")
-        .build()
-    )
-    resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message_resource.get, req)
-    if not resp or getattr(resp, "code", -1) != 0:
-        raise IOError(
-            f"Failed to download file {file_key}: "
-            f"code={getattr(resp, 'code', None)}, msg={getattr(resp, 'msg', None)}"
-        )
-    f = getattr(resp, "file", None)
-    if f is None:
-        raise IOError(f"No file content in response for {file_key}")
-    return f.read()
-
-
-def _remove_reaction(message_id: str, reaction_id: str | None) -> None:
-    """Remove a reaction by its reaction_id."""
-    if not _feishu_client or not reaction_id:
-        return
-    try:
-        req = (
-            DeleteMessageReactionRequest.builder()
-            .message_id(message_id)
-            .reaction_id(reaction_id)
-            .build()
-        )
-        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message_reaction.delete, req)
-        if resp and getattr(resp, "code", 0) != 0:
-            logger.warning(
-                "Delete reaction API code: %s msg: %s",
-                getattr(resp, "code", None),
-                getattr(resp, "msg", ""),
-            )
-        else:
-            logger.info("Removed reaction from %s", message_id)
-    except Exception as e:
-        logger.warning("Failed to remove reaction for %s: %s", message_id, e)
-
-
-def _send_message(open_id: str, text: str) -> None:
-    """Send a direct message to a user by open_id."""
-    if not _feishu_client:
-        logger.error("Feishu HTTP client not initialized")
-        return
-    body = (
-        CreateMessageRequestBody.builder()
-        .receive_id(open_id)
-        .content(json.dumps({"text": text}))
-        .msg_type("text")
-        .build()
-    )
-    req = (
-        CreateMessageRequest.builder()
-        .receive_id_type("open_id")
-        .request_body(body)
-        .build()
-    )
-    try:
-        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message.create, req)
-        if resp and getattr(resp, "code", 0) != 0:
-            logger.warning("Send message API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
-        else:
-            logger.info("Sent message to %s", open_id)
-    except Exception as e:
-        logger.exception("Failed to send message: %s", e)
-
-
-def _send_card_message(open_id: str, card: dict) -> None:
-    """Send an interactive card message to a user by open_id."""
-    if not _feishu_client:
-        logger.error("Feishu HTTP client not initialized")
-        return
-    body = (
-        CreateMessageRequestBody.builder()
-        .receive_id(open_id)
-        .content(json.dumps(card))
-        .msg_type("interactive")
-        .build()
-    )
-    req = (
-        CreateMessageRequest.builder()
-        .receive_id_type("open_id")
-        .request_body(body)
-        .build()
-    )
-    try:
-        resp = call_api(_feishu_api_lock, _feishu_client.im.v1.message.create, req)
-        if resp and getattr(resp, "code", 0) != 0:
-            logger.warning("Send card API code: %s msg: %s", getattr(resp, "code", None), getattr(resp, "msg", ""))
-        else:
-            logger.info("Sent card to %s", open_id)
-    except Exception as e:
-        logger.exception("Failed to send card: %s", e)
-
-
-def _build_help_card(md_text: str) -> dict:
-    """Parse help.md content into a Feishu interactive card."""
-    _EMOJI_MAP = {"[了解]": ":Get:", "[在做了]": ":OnIt:", "[敲键盘]": ":Typing:"}
-    for bracket, colon in _EMOJI_MAP.items():
-        md_text = md_text.replace(bracket, colon)
-
-    # Split by ━━━ section dividers
-    parts = re.split(r"━━━\s*(.*?)\s*━━━", md_text.strip())
-
-    elements = []
-
-    # parts[0] = intro (before first divider)
-    intro = parts[0].strip()
-    if intro:
-        elements.append({"tag": "markdown", "content": intro})
-
-    # Remaining parts come in (title, content) pairs
-    for i in range(1, len(parts), 2):
-        title = parts[i].strip()
-        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
-        elements.append({"tag": "hr"})
-        section_md = f"**{title}**\n\n{body}" if body else f"**{title}**"
-        elements.append({"tag": "markdown", "content": section_md})
-
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📖 读不动了 — 使用帮助"},
-            "template": "blue",
-        },
-        "elements": elements,
-    }
-
-
-def _on_bot_menu(data: P2ApplicationBotMenuV6) -> None:
-    """Handle bot custom menu events."""
-    try:
-        event = data.event
-        event_key = getattr(event, "event_key", None) or ""
-        operator = getattr(event, "operator", None)
-        operator_id = getattr(operator, "operator_id", None) if operator else None
-        open_id = getattr(operator_id, "open_id", None) if operator_id else None
-
-        user_name = _fetch_user_name(open_id) if open_id else None
-        logger.info("Bot menu event: event_key=%s open_id=%s name=%s", event_key, open_id, user_name)
-
-        if event_key == "Action: help" and open_id:
-            _help_file = ROOT / "help.md"
-            try:
-                _help_text = _help_file.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                _help_text = "帮助文件不存在，请联系管理员。"
-            card = _build_help_card(_help_text)
-            _send_card_message(open_id, card)
-    except Exception as e:
-        logger.exception("Bot menu handler error: %s", e)
-
-
-def _noop(_) -> None:
-    """Ignore unsupported event types (e.g. bot_p2p_chat_entered_v1, message_read_v1)."""
-    pass
-
-
-def _fetch_user_name(open_id: str) -> str | None:
-    """Look up a Feishu user's display name by open_id. Returns None on failure."""
-    if not _feishu_client or not open_id:
-        return None
-    try:
-        req = (
-            GetUserRequest.builder()
-            .user_id(open_id)
-            .user_id_type("open_id")
-            .build()
-        )
-        resp = call_api(_feishu_api_lock, _feishu_client.contact.v3.user.get, req)
-        if resp and getattr(resp, "code", 0) == 0:
-            user = getattr(getattr(resp, "data", None), "user", None)
-            return getattr(user, "name", None) if user else None
-        logger.warning("Fetch user name API code: %s, msg: %s", getattr(resp, "code", None), getattr(resp, "msg", None))
-    except Exception as e:
-        logger.warning("Failed to fetch user name for %s: %s", open_id, e)
-    return None
-
-
-def _paper_dir_for_arxiv(arxiv_id: str) -> Path:
-    """Return the local working directory for a paper."""
-    return ROOT / "reader" / "data" / arxiv_id.replace("/", "_")
-
-
-def _doc_link_metadata_path(arxiv_id: str) -> Path:
-    """Return the metadata path used to persist a generated doc link."""
-    return _paper_dir_for_arxiv(arxiv_id) / _DOC_LINK_METADATA_FILE
-
-
-def _load_saved_doc_link(arxiv_id: str) -> str | None:
-    """Load a previously saved Feishu doc link for the given arXiv id."""
-    metadata_path = _doc_link_metadata_path(arxiv_id)
-    if not metadata_path.is_file():
-        return None
-    try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning("Failed to read saved doc link for %s: %s", arxiv_id, e)
-        return None
-
-    link = str(payload.get("doc_url") or "").strip()
-    return link or None
-
-
-def _save_doc_link(arxiv_id: str, document_id: str, document_url: str, tenant_key: str | None) -> None:
-    """Persist the Feishu doc metadata so duplicate requests can reuse it."""
-    paper_dir = _paper_dir_for_arxiv(arxiv_id)
-    paper_dir.mkdir(parents=True, exist_ok=True)
-    metadata_path = _doc_link_metadata_path(arxiv_id)
-    payload = {
-        "arxiv_id": arxiv_id,
-        "document_id": document_id,
-        "doc_url": document_url,
-        "tenant_key": tenant_key,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-    }
-    metadata_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _save_query_log(
+# ---------------------------------------------------------------------------
+# Paper processing
+# ---------------------------------------------------------------------------
+def _build_illustration_card(
+    image_key: str,
     arxiv_id: str,
-    sender_open_id: str | None,
-    sender_name: str | None,
-) -> None:
-    """Append a query record to queries.json in the paper's data directory."""
-    paper_dir = _paper_dir_for_arxiv(arxiv_id)
-    paper_dir.mkdir(parents=True, exist_ok=True)
-    queries_path = paper_dir / "queries.json"
-
-    queries: list[dict] = []
-    if queries_path.is_file():
-        try:
-            queries = json.loads(queries_path.read_text(encoding="utf-8"))
-        except Exception:
-            queries = []
-
-    queries.append({
-        "sender_open_id": sender_open_id,
-        "sender_name": sender_name,
-        "query_time": datetime.now(timezone(timedelta(hours=8))).isoformat(),
-    })
-
-    queries_path.write_text(
-        json.dumps(queries, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _save_reply_time(arxiv_id: str, reply_type: str) -> None:
-    """Update the last query record in queries.json with reply_time."""
-    paper_dir = _paper_dir_for_arxiv(arxiv_id)
-    queries_path = paper_dir / "queries.json"
-    if not queries_path.is_file():
-        return
-    try:
-        queries = json.loads(queries_path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    if not queries:
-        return
-    queries[-1]["reply_time"] = datetime.now(timezone(timedelta(hours=8))).isoformat()
-    queries[-1]["reply_type"] = reply_type
-    queries_path.write_text(
-        json.dumps(queries, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    *,
+    caption: str = "",
+    doc_link: str | None = None,
+) -> dict:
+    elements: list[dict] = [
+        {"tag": "img", "img_key": image_key, "alt": {"tag": "plain_text", "content": "illustration"}},
+    ]
+    if caption:
+        elements.append({"tag": "markdown", "content": caption})
+    if doc_link:
+        elements.append({"tag": "markdown", "content": f"哥，文档写好了 [点击查看]({doc_link})"})
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": f"arXiv {arxiv_id}"},
+                "template": "green",
+            },
+            "body": {"elements": elements},
+        }
+    elements.append({"tag": "markdown", "content": "正在生成文档，预计还需几分钟 ⏳"})
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"arXiv {arxiv_id}"},
+            "template": "indigo",
+        },
+        "body": {"elements": elements},
+    }
 
 
 def _process_one_arxiv_for_message(
@@ -754,26 +169,33 @@ def _process_one_arxiv_for_message(
     sender_open_id: str | None = None,
     sender_name: str | None = None,
 ) -> None:
-    """Download/summarize one paper and reply. staged_reactions drives Get/OnIt/Typing on this message."""
+    """Download/summarize one paper and reply. staged_reactions drives Get/OnIt/Typing on this message.
+
+    After download, two Claude processes run in parallel:
+      1. Summary → Feishu cloud doc
+      2. Illustration prompt → nano_banana → image
+    The reply is sent once both are ready (illustration is best-effort).
+    """
     logger.info("arXiv id %s for message %s", arxiv_id, message_id)
     reaction_id: str | None = None
 
-    _save_query_log(arxiv_id, sender_open_id, sender_name)
+    metadata.save_query_log(arxiv_id, sender_open_id, sender_name)
 
     if staged_reactions:
-        reaction_id = _add_reaction(message_id, "Get")
+        reaction_id = messaging.add_reaction(message_id, "Get")
 
     try:
-        existing_doc_link = _load_saved_doc_link(arxiv_id)
+        existing_doc_link = metadata.load_saved_doc_link(arxiv_id)
         if existing_doc_link:
             logger.info("Reusing saved Feishu doc link for arXiv %s", arxiv_id)
-            _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
-            _save_reply_time(arxiv_id, "reused")
+            messaging.reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+            metadata.save_reply_time(arxiv_id, "reused")
             if staged_reactions and reaction_id:
-                _remove_reaction(message_id, reaction_id)
+                messaging.remove_reaction(message_id, reaction_id)
                 reaction_id = None
             return
 
+        # --- Phase 1: download & prepare paper ---
         def on_progress(msg: str) -> None:
             nonlocal reaction_id
             msg = msg.strip()
@@ -783,22 +205,44 @@ def _process_one_arxiv_for_message(
             if not staged_reactions:
                 return
             if msg.startswith("论文文件已准备完成"):
-                _remove_reaction(message_id, reaction_id)
-                reaction_id = _add_reaction(message_id, "OnIt")
+                messaging.remove_reaction(message_id, reaction_id)
+                reaction_id = messaging.add_reaction(message_id, "OnIt")
 
-        summary = run_summarize(
+        paper_dir = prepare_paper_dir(
             arxiv_id,
             data_dir=ROOT / "reader" / "data",
-            mode="claude",
             progress_callback=on_progress,
         )
 
+        # --- Phase 2: run summary + illustration in parallel ---
+        illustration_result: dict = {"image_key": None, "caption": "", "card_message_id": None}
+        illust_thread = None
+
+        if sender_open_id == _OWNER_OPEN_ID:
+            def _illustration_worker() -> None:
+                image_key, caption = illustration.run_illustration_pipeline(paper_dir, arxiv_id)
+                illustration_result["image_key"] = image_key
+                illustration_result["caption"] = caption
+                if image_key:
+                    card = _build_illustration_card(image_key, arxiv_id, caption=caption)
+                    card_msg_id = messaging.reply_with_card(message_id, card)
+                    illustration_result["card_message_id"] = card_msg_id
+
+            illust_thread = threading.Thread(
+                target=_illustration_worker,
+                name=f"illust_{arxiv_id}",
+                daemon=True,
+            )
+            illust_thread.start()
+
+        # Summary runs in the current thread
+        summary = summarize_prepared_dir(paper_dir, mode="claude")
+
         if staged_reactions:
-            _remove_reaction(message_id, reaction_id)
-            reaction_id = _add_reaction(message_id, "Typing")
+            messaging.remove_reaction(message_id, reaction_id)
+            reaction_id = messaging.add_reaction(message_id, "Typing")
 
         title = f"arXiv {arxiv_id} 摘要"
-        paper_dir = _paper_dir_for_arxiv(arxiv_id)
         is_pdf_source = (paper_dir / "paper.pdf").is_file()
         is_txt_converted = (paper_dir / "paper.txt").is_file()
         if is_pdf_source and is_txt_converted:
@@ -810,23 +254,37 @@ def _process_one_arxiv_for_message(
                 _feishu_client, title, summary, base_dir=paper_dir, arxiv_id=arxiv_id,
                 api_lock=_feishu_api_lock,
             )
+
+        # --- Phase 3: wait for illustration, then send or update reply ---
+        if illust_thread is not None:
+            illust_thread.join(timeout=300)
+        image_key = illustration_result["image_key"]
+        card_message_id = illustration_result["card_message_id"]
+
         if doc_id:
             document_link = doc_url(doc_id, tenant_key)
-            _save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
-            _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
-            _save_reply_time(arxiv_id, "success")
+            metadata.save_doc_link(arxiv_id, doc_id, document_link, tenant_key)
+            caption = illustration_result["caption"]
+            if card_message_id:
+                card = _build_illustration_card(image_key, arxiv_id, caption=caption, doc_link=document_link)
+                messaging.update_card(card_message_id, card)
+            elif image_key:
+                messaging.reply_with_doc_and_image(message_id, document_link, image_key)
+            else:
+                messaging.reply_to_message(message_id, f"哥，文档写好了 {document_link}")
+            metadata.save_reply_time(arxiv_id, "success")
         else:
-            _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
-            _save_reply_time(arxiv_id, "success_no_link")
+            messaging.reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（arXiv {arxiv_id}）")
+            metadata.save_reply_time(arxiv_id, "success_no_link")
     except ArxivNotFoundError:
         logger.warning("arXiv 404: paper %s not found", arxiv_id)
-        _reply_to_message(message_id, f"哥，我文章下载不了（arXiv {arxiv_id}）")
-        _save_reply_time(arxiv_id, "not_found")
+        messaging.reply_to_message(message_id, f"哥，我文章下载不了（arXiv {arxiv_id}）")
+        metadata.save_reply_time(arxiv_id, "not_found")
         return
     except PdfExtractionError as e:
         logger.warning("PDF extraction failed for %s: %s", arxiv_id, e)
-        _reply_to_message(message_id, f"哥，这篇文章只有PDF没有源码，文字提取也失败了（arXiv {arxiv_id}）")
-        _save_reply_time(arxiv_id, "pdf_extraction_failed")
+        messaging.reply_to_message(message_id, f"哥，这篇文章只有PDF没有源码，文字提取也失败了（arXiv {arxiv_id}）")
+        metadata.save_reply_time(arxiv_id, "pdf_extraction_failed")
         return
     except Exception as e:
         logger.exception("Summarize/reply failed: %s", e)
@@ -836,7 +294,7 @@ def _process_one_arxiv_for_message(
         raise
     finally:
         if staged_reactions and reaction_id:
-            _remove_reaction(message_id, reaction_id)
+            messaging.remove_reaction(message_id, reaction_id)
 
 
 def _process_one_pdf_for_message(
@@ -855,28 +313,28 @@ def _process_one_pdf_for_message(
     paper_id: str | None = None
 
     if staged_reactions:
-        reaction_id = _add_reaction(message_id, "Get")
+        reaction_id = messaging.add_reaction(message_id, "Get")
 
     try:
         logger.info("Downloading PDF %s from Feishu...", file_name)
-        file_bytes = _download_feishu_file(message_id, file_key)
+        file_bytes = messaging.download_feishu_file(message_id, file_key)
 
         file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
         paper_id = file_hash
 
-        _save_query_log(paper_id, sender_open_id, sender_name)
+        metadata.save_query_log(paper_id, sender_open_id, sender_name)
 
-        existing_doc_link = _load_saved_doc_link(paper_id)
+        existing_doc_link = metadata.load_saved_doc_link(paper_id)
         if existing_doc_link:
             logger.info("Reusing saved Feishu doc link for PDF %s", paper_id)
-            _reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
-            _save_reply_time(paper_id, "reused")
+            messaging.reply_to_message(message_id, f"哥，之前的文档在这里 {existing_doc_link}")
+            metadata.save_reply_time(paper_id, "reused")
             if staged_reactions and reaction_id:
-                _remove_reaction(message_id, reaction_id)
+                messaging.remove_reaction(message_id, reaction_id)
                 reaction_id = None
             return
 
-        paper_dir = _paper_dir_for_arxiv(paper_id)
+        paper_dir = ROOT / "reader" / "data" / paper_id
         paper_dir.mkdir(parents=True, exist_ok=True)
         (paper_dir / "paper.pdf").write_bytes(file_bytes)
 
@@ -889,9 +347,10 @@ def _process_one_pdf_for_message(
             if not staged_reactions:
                 return
             if msg.startswith("论文文件已准备完成"):
-                _remove_reaction(message_id, reaction_id)
-                reaction_id = _add_reaction(message_id, "OnIt")
+                messaging.remove_reaction(message_id, reaction_id)
+                reaction_id = messaging.add_reaction(message_id, "OnIt")
 
+        from reader.arxiv_summarize import run_local_summarize
         summary = run_local_summarize(
             paper_id,
             data_dir=ROOT / "reader" / "data",
@@ -900,8 +359,8 @@ def _process_one_pdf_for_message(
         )
 
         if staged_reactions:
-            _remove_reaction(message_id, reaction_id)
-            reaction_id = _add_reaction(message_id, "Typing")
+            messaging.remove_reaction(message_id, reaction_id)
+            reaction_id = messaging.add_reaction(message_id, "Typing")
 
         title_base = Path(file_name).stem if file_name else paper_id
         title = f"{title_base} 摘要"
@@ -916,17 +375,17 @@ def _process_one_pdf_for_message(
             )
         if doc_id:
             document_link = doc_url(doc_id, tenant_key)
-            _save_doc_link(paper_id, doc_id, document_link, tenant_key)
-            _reply_to_message(message_id, f"哥，文档写好了 {document_link}")
-            _save_reply_time(paper_id, "success")
+            metadata.save_doc_link(paper_id, doc_id, document_link, tenant_key)
+            messaging.reply_to_message(message_id, f"哥，文档写好了 {document_link}")
+            metadata.save_reply_time(paper_id, "success")
         else:
-            _reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（{file_name}）")
-            _save_reply_time(paper_id, "success_no_link")
+            messaging.reply_to_message(message_id, f"哥，文档写好了，但文档链接生成失败（{file_name}）")
+            metadata.save_reply_time(paper_id, "success_no_link")
     except PdfExtractionError as e:
         logger.warning("PDF extraction failed for %s: %s", file_name, e)
-        _reply_to_message(message_id, f"哥，这个PDF文字提取失败了（{file_name}）")
+        messaging.reply_to_message(message_id, f"哥，这个PDF文字提取失败了（{file_name}）")
         if paper_id:
-            _save_reply_time(paper_id, "pdf_extraction_failed")
+            metadata.save_reply_time(paper_id, "pdf_extraction_failed")
         return
     except Exception as e:
         logger.exception("PDF processing failed for %s: %s", file_name, e)
@@ -936,9 +395,12 @@ def _process_one_pdf_for_message(
         raise
     finally:
         if staged_reactions and reaction_id:
-            _remove_reaction(message_id, reaction_id)
+            messaging.remove_reaction(message_id, reaction_id)
 
 
+# ---------------------------------------------------------------------------
+# Feishu event handlers
+# ---------------------------------------------------------------------------
 def _on_message(data: P2ImMessageReceiveV1) -> None:
     """On Feishu message: if it contains an arXiv link or a PDF file, summarize and reply (work runs in background)."""
     try:
@@ -978,8 +440,8 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
                     _processed_message_ids.clear()
                 _processed_message_ids.add(message_id)
 
-            sender_name = _fetch_user_name(sender_open_id) if sender_open_id else None
-            _enqueue_pdf_job(
+            sender_name = messaging.fetch_user_name(sender_open_id) if sender_open_id else None
+            job_queue.enqueue_pdf_job(
                 message_id, tenant_key, file_key, file_name,
                 sender_open_id=sender_open_id, sender_name=sender_name,
             )
@@ -1005,7 +467,7 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         if not text:
             return
 
-        sender_name = _fetch_user_name(sender_open_id) if sender_open_id else None
+        sender_name = messaging.fetch_user_name(sender_open_id) if sender_open_id else None
 
         ids = extract_arxiv_ids(text)
         if not ids:
@@ -1019,14 +481,14 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
             _processed_message_ids.add(message_id)
 
         if len(ids) == 1:
-            _enqueue_arxiv_job(message_id, tenant_key, ids[0], staged_reactions=True,
+            job_queue.enqueue_arxiv_job(message_id, tenant_key, ids[0], staged_reactions=True,
                                sender_open_id=sender_open_id, sender_name=sender_name)
             return
 
-        reaction_id = _add_reaction(message_id, "Get")
-        _ensure_group_state(message_id, len(ids), reaction_id)
+        reaction_id = messaging.add_reaction(message_id, "Get")
+        job_queue.ensure_group_state(message_id, len(ids), reaction_id)
         for arxiv_id in ids:
-            _enqueue_arxiv_job(
+            job_queue.enqueue_arxiv_job(
                 message_id,
                 tenant_key,
                 arxiv_id,
@@ -1039,6 +501,38 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         logger.exception("Handler error: %s", e)
 
 
+def _on_bot_menu(data: P2ApplicationBotMenuV6) -> None:
+    """Handle bot custom menu events."""
+    try:
+        event = data.event
+        event_key = getattr(event, "event_key", None) or ""
+        operator = getattr(event, "operator", None)
+        operator_id = getattr(operator, "operator_id", None) if operator else None
+        open_id = getattr(operator_id, "open_id", None) if operator_id else None
+
+        user_name = messaging.fetch_user_name(open_id) if open_id else None
+        logger.info("Bot menu event: event_key=%s open_id=%s name=%s", event_key, open_id, user_name)
+
+        if event_key == "Action: help" and open_id:
+            _help_file = ROOT / "prompts" / "help.md"
+            try:
+                _help_text = _help_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                _help_text = "帮助文件不存在，请联系管理员。"
+            card = messaging.build_help_card(_help_text)
+            messaging.send_card_message(open_id, card)
+    except Exception as e:
+        logger.exception("Bot menu handler error: %s", e)
+
+
+def _noop(_) -> None:
+    """Ignore unsupported event types (e.g. bot_p2p_chat_entered_v1, message_read_v1)."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main() -> None:
     global _feishu_client
     cfg = get_config()
@@ -1049,7 +543,19 @@ def main() -> None:
         sys.exit(1)
 
     _feishu_client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
-    _initialize_queue()
+
+    # Initialize modules
+    messaging.init(_feishu_client, _feishu_api_lock)
+    metadata.init(ROOT)
+    job_queue.init(
+        ROOT,
+        process_arxiv=_process_one_arxiv_for_message,
+        process_pdf=_process_one_pdf_for_message,
+        reply_to_message=messaging.reply_to_message,
+        remove_reaction=messaging.remove_reaction,
+    )
+    job_queue.initialize()
+
     encrypt_key = cfg.get("encrypt_key") or ""
     token = cfg.get("verification_token") or ""
     handler = (
