@@ -1,0 +1,15 @@
+export default {
+  bg: '#ffffff',
+  text: '#1a1a1a',
+  textSecondary: '#4b5563',
+  textMuted: '#6b7280',
+  textLight: '#9ca3af',
+  border: '#d1d5db',
+  accent: '#2563eb',
+  accentDark: '#1e40af',
+  secondary: '#93c5fd',
+  secondaryLight: '#dbeafe',
+  conclusionBg: '#eff6ff',
+  panelBg: '#f9fafb',
+  axis: '#9ca3af',
+};

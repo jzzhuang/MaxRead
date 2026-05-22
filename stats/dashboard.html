@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MaxRead 用量统计</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #0f1419;
+  color: #e7e9ea;
+  padding: 24px;
+  min-height: 100vh;
+}
+h1 {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.subtitle { color: #71767b; font-size: 14px; margin-bottom: 24px; }
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+  margin-bottom: 32px;
+}
+.stat-card {
+  background: #1e2732;
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+  border: 1px solid #2f3336;
+  transition: transform 0.2s;
+}
+.stat-card:hover { transform: translateY(-2px); border-color: #667eea; }
+.stat-value {
+  font-size: 32px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 4px;
+}
+.stat-label { font-size: 13px; color: #71767b; }
+.charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+  gap: 24px;
+  margin-bottom: 32px;
+}
+.chart-card {
+  background: #1e2732;
+  border-radius: 12px;
+  padding: 24px;
+  border: 1px solid #2f3336;
+}
+.chart-card h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: #e7e9ea;
+}
+.chart-card.full-width { grid-column: 1 / -1; }
+canvas { max-height: 320px; }
+.heatmap-container { overflow-x: auto; }
+.heatmap {
+  display: grid;
+  grid-template-columns: 48px repeat(24, 1fr);
+  gap: 2px;
+  min-width: 600px;
+}
+.heatmap-cell {
+  aspect-ratio: 1;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: rgba(255,255,255,0.7);
+  min-width: 20px;
+}
+.heatmap-label {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  color: #71767b;
+  padding-right: 8px;
+}
+.heatmap-hour {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: #71767b;
+}
+.docs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.docs-table th {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid #2f3336;
+  color: #71767b;
+  font-weight: 500;
+}
+.docs-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid #2f3336;
+}
+.docs-table tr:hover { background: rgba(102, 126, 234, 0.05); }
+.docs-table .rank { color: #71767b; width: 30px; }
+.docs-table .title-cell { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docs-table .title-cell a { color: #667eea; text-decoration: none; }
+.docs-table .title-cell a:hover { text-decoration: underline; }
+.docs-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 768px) {
+  .charts-grid { grid-template-columns: 1fr; }
+  body { padding: 16px; }
+}
+</style>
+</head>
+<body>
+
+<h1>MaxRead 用量统计</h1>
+<p class="subtitle">2026-04-15 ~ 2026-05-21 | 数据实时来自 queries.json + Feishu Doc API</p>
+
+<div class="summary-grid">
+  <div class="stat-card"><div class="stat-value">906</div><div class="stat-label">总查询数</div></div>
+  <div class="stat-card"><div class="stat-value">107</div><div class="stat-label">独立用户</div></div>
+  <div class="stat-card"><div class="stat-value">665</div><div class="stat-label">论文数</div></div>
+  <div class="stat-card"><div class="stat-value">25.2</div><div class="stat-label">日均查询</div></div>
+  <div class="stat-card"><div class="stat-value">10.5</div><div class="stat-label">日均用户</div></div>
+  <div class="stat-card"><div class="stat-value">70.8%</div><div class="stat-label">成功率</div></div>
+</div>
+
+<div class="charts-grid">
+  <div class="chart-card full-width">
+    <h3>每日查询量与活跃用户</h3>
+    <canvas id="dailyChart"></canvas>
+  </div>
+
+  <div class="chart-card">
+    <h3>24 小时查询分布</h3>
+    <canvas id="hourlyChart"></canvas>
+  </div>
+
+  <div class="chart-card">
+    <h3>星期分布</h3>
+    <canvas id="weekdayChart"></canvas>
+  </div>
+
+  <div class="chart-card">
+    <h3>回复类型</h3>
+    <canvas id="replyChart"></canvas>
+  </div>
+
+  <div class="chart-card">
+    <h3>Top 15 用户 (查询数 vs 论文数)</h3>
+    <canvas id="usersChart"></canvas>
+  </div>
+
+  <div class="chart-card full-width">
+    <h3>活跃热力图 (星期 × 小时)</h3>
+    <div class="heatmap-container">
+      <div class="heatmap" id="heatmap"></div>
+    </div>
+  </div>
+
+  <div class="chart-card full-width">
+    <h3>Top 15 热门文档 (UV 阅读量)</h3>
+    <table class="docs-table">
+      <thead><tr><th>#</th><th>标题</th><th class="num">UV</th><th class="num">PV-UV</th></tr></thead>
+      <tbody id="docsTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const DATA = {
+  daily: {
+    dates: ["2026-04-15","2026-04-16","2026-04-17","2026-04-18","2026-04-19","2026-04-20","2026-04-21","2026-04-22","2026-04-23","2026-04-24","2026-04-25","2026-04-26","2026-04-27","2026-04-28","2026-04-29","2026-04-30","2026-05-01","2026-05-02","2026-05-03","2026-05-05","2026-05-06","2026-05-07","2026-05-08","2026-05-09","2026-05-10","2026-05-11","2026-05-12","2026-05-13","2026-05-14","2026-05-15","2026-05-16","2026-05-17","2026-05-18","2026-05-19","2026-05-20","2026-05-21"],
+    queries: [3,109,15,4,5,34,38,24,26,11,9,1,11,23,14,9,11,6,2,9,20,44,25,20,7,41,39,38,54,24,26,15,106,35,27,21],
+    users: [1,22,9,3,4,10,18,12,13,8,4,1,8,12,9,8,6,3,2,3,12,20,10,13,4,21,21,18,18,13,10,7,21,16,10,8],
+    new_papers: [1,32,12,3,4,29,29,22,22,7,9,1,11,19,9,9,9,6,1,8,16,33,16,16,7,29,34,33,44,21,18,13,66,34,24,18]
+  },
+  hourly: [10,10,7,5,0,1,1,6,10,15,57,60,36,52,117,102,72,57,42,51,74,41,55,25],
+  weekday: { queries: [192,144,126,263,86,65,30], users: [43,48,42,59,32,28,15] },
+  reply_types: { success: 641, reused: 148, unknown: 115, not_found: 1, pdf_extraction_failed: 1 },
+  top_users: {
+    names: ["天择","云天明","紫藤","陈垚","青稞","River","Rocky","朗姆","Maple","Amanda","Rill","陈虫","核羽","Ray","骁龙"],
+    queries: [96,65,60,50,42,32,31,26,24,23,22,21,18,18,16],
+    papers: [75,50,10,50,36,32,31,19,15,19,20,21,17,17,16]
+  },
+  heatmap: [[0,1,3,0,0,0,0,0,0,1,9,15,2,6,46,55,13,7,2,14,4,5,5,4],[4,0,0,0,0,0,0,0,2,5,5,4,6,17,16,6,18,13,13,14,15,5,1,0],[1,2,2,0,0,0,0,2,1,3,6,10,10,7,14,9,8,14,7,6,14,8,0,2],[0,3,0,0,0,0,0,2,7,3,26,19,11,13,26,15,17,13,14,10,26,9,41,8],[0,2,1,1,0,1,0,0,0,1,6,9,1,3,7,13,8,5,4,4,12,1,5,2],[2,1,1,2,0,0,0,2,0,0,3,2,4,6,5,4,6,1,2,0,2,11,2,9],[3,1,0,2,0,0,1,0,0,2,2,1,2,0,3,0,2,4,0,3,1,2,1,0]],
+  top_docs: [
+    {title:"Seedance 2.0：面向真实世界复杂性的多模态音视频联合生成",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/DChjdn5XIoFNdZxE4JpcxgSFnQd",uv:58,pv_uv:16},
+    {title:"OpenSeeker-v2：仅靠 SFT 与高质量数据，学术团队如何训出前沿搜索智能体",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/Q86ZddRHKoPJ70xWWuWceGBqnyb",uv:38,pv_uv:11},
+    {title:"ByteRobust：面向大规模 LLM 训练的鲁棒基础设施系统",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/EehDdRVoiogBNfxdubzcZKGOnvf",uv:36,pv_uv:3},
+    {title:"Model Spec Midtraining：通过教会模型\"理解规范\"来改善对齐泛化",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/GdsQdPc5hofs7nxouFocgGvUnue",uv:36,pv_uv:6},
+    {title:"DeepSeek-V4：面向百万 token 上下文的高效大语言模型架构",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/UV7UdjK8LogjKOxVQpWcIF4vnbe",uv:34,pv_uv:14},
+    {title:"跨数据中心 KVCache：下一代混合注意力模型的 Prefill-as-a-Service 架构",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/O2h7dPEyFomhg5x7zdVc3PMcnNd",uv:28,pv_uv:7},
+    {title:"GLM-5V-Turbo：面向原生多模态 Agent 的基础模型",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/MeFXdSLhRoumYQxQAmGc9tmln1Q",uv:26,pv_uv:11},
+    {title:"Qwen3.5-Omni：面向全模态感知、推理与实时交互的统一大模型",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/F8ovdJ8WkoJ0ELx5RI9c4Bt8n3c",uv:24,pv_uv:5},
+    {title:"将 Fréchet Distance 从评估指标变为训练损失：表示空间中的分布匹配后训练",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/WmvzdGHrDocbbTxn6IYcSWOTnhd",uv:23,pv_uv:4},
+    {title:"CodeTracer：面向代码智能体的可追踪状态与失败溯源框架",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/IKf7ddDUmoFuiNxDrN3c5HFonbe",uv:21,pv_uv:2},
+    {title:"UniVA：面向下一代视频智能的开源统一多智能体框架",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/Cn6CdTjfZohrwuxdK10cz42jnEh",uv:20,pv_uv:6},
+    {title:"ACE：将上下文当作可进化的 Playbook，实现 LLM 的自我改进",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/UgPmdoQpZoEpFtxyyBTcjauKnff",uv:19,pv_uv:4},
+    {title:"ELF：基于连续嵌入空间 Flow Matching 的扩散语言模型",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/RBabdZ7nxoIz7wxMqaMcETKpn7e",uv:19,pv_uv:5},
+    {title:"数据混合可以引发知识获取的相变现象",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/Q6mvdheoLohKcQxXpCCcU2QinTe",uv:18,pv_uv:14},
+    {title:"ProgramBench：语言模型能从零构建完整软件吗？",doc_url:"https://2cc6b530168f9758.feishu.cn/docx/EYyddum5hocibzxuER7cMkgrnje",uv:18,pv_uv:3}
+  ]
+};
+
+Chart.defaults.color = '#71767b';
+Chart.defaults.borderColor = '#2f3336';
+Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+// Daily chart
+new Chart(document.getElementById('dailyChart'), {
+  type: 'bar',
+  data: {
+    labels: DATA.daily.dates.map(d => d.slice(5)),
+    datasets: [
+      { type: 'line', label: '活跃用户', data: DATA.daily.users, borderColor: '#f7768e', backgroundColor: 'rgba(247,118,142,0.1)', tension: 0.3, yAxisID: 'y1', pointRadius: 3 },
+      { type: 'bar', label: '查询数', data: DATA.daily.queries, backgroundColor: 'rgba(102,126,234,0.7)', borderRadius: 4, yAxisID: 'y' },
+      { type: 'bar', label: '新论文', data: DATA.daily.new_papers, backgroundColor: 'rgba(118,75,162,0.5)', borderRadius: 4, yAxisID: 'y' },
+    ]
+  },
+  options: {
+    responsive: true,
+    interaction: { mode: 'index', intersect: false },
+    scales: {
+      y: { position: 'left', grid: { color: '#2f3336' } },
+      y1: { position: 'right', grid: { display: false }, max: 30 },
+      x: { grid: { display: false } }
+    },
+    plugins: { legend: { position: 'top' } }
+  }
+});
+
+// Hourly chart
+new Chart(document.getElementById('hourlyChart'), {
+  type: 'bar',
+  data: {
+    labels: Array.from({length: 24}, (_, i) => `${i}:00`),
+    datasets: [{ label: '查询数', data: DATA.hourly, backgroundColor: ctx => {
+      const v = DATA.hourly[ctx.dataIndex];
+      const max = Math.max(...DATA.hourly);
+      const ratio = v / max;
+      return `rgba(102, 126, 234, ${0.3 + ratio * 0.7})`;
+    }, borderRadius: 4 }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: { x: { grid: { display: false } }, y: { grid: { color: '#2f3336' } } }
+  }
+});
+
+// Weekday chart
+const weekdayNames = ['周一','周二','周三','周四','周五','周六','周日'];
+new Chart(document.getElementById('weekdayChart'), {
+  type: 'bar',
+  data: {
+    labels: weekdayNames,
+    datasets: [
+      { label: '查询数', data: DATA.weekday.queries, backgroundColor: 'rgba(102,126,234,0.7)', borderRadius: 4, yAxisID: 'y' },
+      { type: 'line', label: '独立用户', data: DATA.weekday.users, borderColor: '#f7768e', tension: 0.3, yAxisID: 'y1', pointRadius: 5 }
+    ]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { position: 'left', grid: { color: '#2f3336' } },
+      y1: { position: 'right', grid: { display: false } },
+      x: { grid: { display: false } }
+    }
+  }
+});
+
+// Reply type donut
+new Chart(document.getElementById('replyChart'), {
+  type: 'doughnut',
+  data: {
+    labels: ['新生成 (success)', '复用缓存 (reused)', '未记录 (unknown)', '其他错误'],
+    datasets: [{
+      data: [641, 148, 115, 2],
+      backgroundColor: ['#667eea', '#7dd3fc', '#71767b', '#f7768e'],
+      borderWidth: 0
+    }]
+  },
+  options: {
+    responsive: true,
+    cutout: '60%',
+    plugins: { legend: { position: 'bottom', labels: { padding: 16 } } }
+  }
+});
+
+// Top users horizontal bar
+new Chart(document.getElementById('usersChart'), {
+  type: 'bar',
+  data: {
+    labels: DATA.top_users.names,
+    datasets: [
+      { label: '查询数', data: DATA.top_users.queries, backgroundColor: 'rgba(102,126,234,0.7)', borderRadius: 4 },
+      { label: '论文数', data: DATA.top_users.papers, backgroundColor: 'rgba(118,75,162,0.6)', borderRadius: 4 }
+    ]
+  },
+  options: {
+    indexAxis: 'y',
+    responsive: true,
+    scales: { x: { grid: { color: '#2f3336' } }, y: { grid: { display: false } } },
+    plugins: { legend: { position: 'top' } }
+  }
+});
+
+// Heatmap
+(function() {
+  const container = document.getElementById('heatmap');
+  const days = ['周一','周二','周三','周四','周五','周六','周日'];
+  const maxVal = Math.max(...DATA.heatmap.flat());
+
+  // Header row
+  container.innerHTML = '<div class="heatmap-label"></div>';
+  for (let h = 0; h < 24; h++) {
+    container.innerHTML += `<div class="heatmap-hour">${h}</div>`;
+  }
+
+  for (let d = 0; d < 7; d++) {
+    container.innerHTML += `<div class="heatmap-label">${days[d]}</div>`;
+    for (let h = 0; h < 24; h++) {
+      const v = DATA.heatmap[d][h];
+      const intensity = v / maxVal;
+      const bg = v === 0 ? 'rgba(255,255,255,0.03)' : `rgba(102, 126, 234, ${0.15 + intensity * 0.85})`;
+      container.innerHTML += `<div class="heatmap-cell" style="background:${bg}" title="${days[d]} ${h}:00 - ${v} 查询">${v || ''}</div>`;
+    }
+  }
+})();
+
+// Docs table
+(function() {
+  const tbody = document.getElementById('docsTable');
+  DATA.top_docs.forEach((doc, i) => {
+    tbody.innerHTML += `<tr>
+      <td class="rank">${i + 1}</td>
+      <td class="title-cell"><a href="${doc.doc_url}" target="_blank">${doc.title}</a></td>
+      <td class="num">${doc.uv}</td>
+      <td class="num">${doc.pv_uv}</td>
+    </tr>`;
+  });
+})();
+</script>
+</body>
+</html>

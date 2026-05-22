@@ -132,14 +132,45 @@ def _claim_next_job() -> tuple[Path, dict] | None:
     with _queue_lock:
         if _restart_scheduled:
             return None
-        pending_paths = sorted(_QUEUE_PENDING_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        for pending_path in pending_paths:
+
+        pending_paths = sorted(
+            _QUEUE_PENDING_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not pending_paths:
+            return None
+
+        # Count jobs per sender across pending + running
+        sender_load: dict[str, int] = {}
+        pending_jobs: list[tuple[Path, dict]] = []
+        for path in pending_paths:
+            try:
+                payload = _read_json_file(path)
+            except Exception:
+                continue
+            pending_jobs.append((path, payload))
+            sender = payload.get("sender_open_id") or ""
+            sender_load[sender] = sender_load.get(sender, 0) + 1
+        for path in _QUEUE_RUNNING_DIR.glob("*.json"):
+            try:
+                payload = _read_json_file(path)
+            except Exception:
+                continue
+            sender = payload.get("sender_open_id") or ""
+            sender_load[sender] = sender_load.get(sender, 0) + 1
+
+        # Prioritize senders with fewest total jobs; stable sort preserves FIFO within same load
+        pending_jobs.sort(
+            key=lambda item: sender_load.get(item[1].get("sender_open_id") or "", 0),
+        )
+
+        for pending_path, payload in pending_jobs:
             running_path = _QUEUE_RUNNING_DIR / pending_path.name
             try:
                 pending_path.replace(running_path)
             except FileNotFoundError:
                 continue
-            return running_path, _read_json_file(running_path)
+            return running_path, payload
     return None
 
 
