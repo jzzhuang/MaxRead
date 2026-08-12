@@ -1,6 +1,6 @@
 lark-oapi>=1.7,<2
 mcp>=1.29,<2
-openai>=2,<3
+openai>=2.53.0,<3
 pymupdf>=1.28,<2
 pymupdf4llm>=1.28,<2
 python-dotenv>=1.2,<2
