@@ -1,0 +1,10 @@
+{
+  "name": "maxread-katex-validator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KaTeX validation helper for MaxRead",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "katex": "0.16.22"
+  }
+}

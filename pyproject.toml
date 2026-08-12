@@ -1,0 +1,19 @@
+[project]
+name = "maxread"
+version = "1.0.0"
+description = "A Feishu bot that turns arXiv papers and PDFs into Chinese reading notes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+authors = [{ name = "MaxRead contributors" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+ignore = ["E402", "E501"]
