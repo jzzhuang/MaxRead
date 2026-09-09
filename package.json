@@ -5,6 +5,6 @@
   "description": "KaTeX validation helper for MaxRead",
   "license": "AGPL-3.0-only",
   "dependencies": {
-    "katex": "0.16.22"
+    "katex": "0.18.6"
   }
 }
